@@ -3,7 +3,6 @@ from torch.nn.utils.rnn import pad_sequence
 from protocol import RolloutGroup, Trajectory
 
 
-
 def collate_groups(groups, pad_token_id):
     """ flattent the groups into one row per trajectory.
     input_ids = [B, T] (prompt + response and right padded)

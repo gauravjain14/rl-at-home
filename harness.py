@@ -32,6 +32,19 @@ rollout_group = RolloutGroup(
         Trajectory([1, 2], [5], [-2.0], [True], 0.0, "stop"),
     ],
 )
+some_trajectories = [
+    Trajectory([1, 2], [3, 4], [-1.2, -0.7], [True, True], 1.0, "stop"),
+    Trajectory([1, 2], [5], [-2.0], [True], 0.0, "stop"),
+]
+batch = collate_groups([rollout_group], pad_token_id=0)
 
-batch = collate_groups([rollout_group])
-print(f"Batch: {batch}")
+batch = {key: value.to(device) for key, value in batch.items()}
+
+# score the batch (this is using the learner policy)
+with torch.no_grad():
+    current_logprobs = score_batch(model, batch)
+
+# behavior logprobs are stored as token id and the probs of picking that
+# unlike outputs from model that are token id and probs of picking the next
+behavior_logprobs = batch["behavior_logprobs"][:, 1:]
+print(behavior_logprobs.shape)
