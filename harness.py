@@ -4,6 +4,7 @@ from transformers import Qwen2Config, Qwen2ForCausalLM
 from protocol import RolloutGroup, Trajectory
 from batching import collate_groups
 from learner import score_batch
+from losses import group_advantages, clipped_policy_loss
 
 torch.manual_seed(7)
 torch.set_printoptions(precision=3, sci_mode=False)
@@ -18,6 +19,8 @@ model = Qwen2ForCausalLM(Qwen2Config(
     num_hidden_layers=1, num_attention_heads=2, num_key_value_heads=2,
     max_position_embeddings=16, pad_token_id=0,
 )).to(device).eval()
+
+optimizer = torch.optim.SGD(model.parameters(), lr=1e-3)
 
 # source learner is step the step at which the trainer was when
 # the rollout group was first launched.
@@ -41,10 +44,46 @@ batch = collate_groups([rollout_group], pad_token_id=0)
 batch = {key: value.to(device) for key, value in batch.items()}
 
 # score the batch (this is using the learner policy)
-with torch.no_grad():
-    current_logprobs = score_batch(model, batch)
+# with torch.no_grad():
+current_logprobs = score_batch(model, batch)
 
 # behavior logprobs are stored as token id and the probs of picking that
 # unlike outputs from model that are token id and probs of picking the next
 behavior_logprobs = batch["behavior_logprobs"][:, 1:]
-print(behavior_logprobs.shape)
+print("rewards ", batch["rewards"])
+print(f"group index", batch["group_index"])
+advantages = group_advantages(batch["rewards"], batch["group_index"])
+
+# learner's scores before the optimizer update (perhaps SFT policy?)
+proximal_logprobs = current_logprobs.detach().clone()
+
+# Because I keep forgetting why the slicing is there - 
+# it's because behavior log probs are stored as token id, i.e.
+# prob of picking that token id unlike outputs from model
+# that has inp token id and probns of picking next token
+loss_mask = batch["loss_mask"][:, 1:]
+
+# loss_mask should be set corresponding to the generated tokens.
+# For the two trajectory above - 
+# [0, 0, 1, 1] and [0, 0, 1, 0]
+loss = clipped_policy_loss(
+    current_logprobs=current_logprobs,
+    behavior_logprobs=behavior_logprobs,
+    proximal_logprobs=proximal_logprobs,
+    advantages=advantages,
+    loss_mask=loss_mask
+)
+
+optimizer.zero_grad(set_to_none=True)
+loss.backward()
+
+grad_norm = torch.nn.utils.clip_grad_norm_(
+    model.parameters(),
+    max_norm=1.0,
+    error_if_nonfinite=True,
+)
+
+optimizer.step()
+
+print("Loss:", loss.item())
+print("Gradient norm before clipping:", grad_norm.item())

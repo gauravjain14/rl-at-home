@@ -41,6 +41,12 @@ def clipped_policy_loss(
         clip_eps=0.2,
         correction=2.0,
 ):
+    """
+    Current is the live trainer policy: it scores the recorded tokens with gradients
+        enabled, and its weights change with optimizer steps.
+    Behavior is generator policy and proximal policy is something that stays fixed
+        during the chosen update window.
+    """
     if not (
       0 <= clip_eps < 1
       and math.isfinite(correction)
