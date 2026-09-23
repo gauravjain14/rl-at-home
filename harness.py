@@ -66,6 +66,8 @@ loss_mask = batch["loss_mask"][:, 1:]
 # loss_mask should be set corresponding to the generated tokens.
 # For the two trajectory above - 
 # [0, 0, 1, 1] and [0, 0, 1, 0]
+
+print(f"proximal_logprobs ", proximal_logprobs.shape)
 loss = clipped_policy_loss(
     current_logprobs=current_logprobs,
     behavior_logprobs=behavior_logprobs,

@@ -20,10 +20,10 @@ def train_step(model, optimizer, batch, proximal_logprobs):
     )
     loss = clipped_policy_loss(
         current_logprobs=current_logprobs,
-        behavior_logprobs=batch["behavior_logprobs"],
+        behavior_logprobs=batch["behavior_logprobs"][:, 1:],
         proximal_logprobs=proximal_logprobs,
         advantages=advantages,
-        loss_mask=batch["loss_mask"],
+        loss_mask=batch["loss_mask"][:, 1:],
     )
     loss.backward()
     grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters())
