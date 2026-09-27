@@ -26,10 +26,13 @@ def train_step(model, optimizer, batch, proximal_logprobs):
         loss_mask=batch["loss_mask"][:, 1:],
     )
     loss.backward()
-    grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters())
+    grad_norm = torch.nn.utils.clip_grad_norm_(
+        model.parameters(),
+        max_norm=1.0,
+        error_if_nonfinite=True)
     optimizer.step()
 
-    return {"loss": loss.item(), "grad_norm": grad_norm}
+    return {"loss": loss.item(), "grad_norm": grad_norm.item()}
 
 def score_batch(model, batch):
     outputs = model(

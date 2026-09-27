@@ -1,4 +1,9 @@
+import math
+import time
+
 import torch
+
+from protocol import Trajectory, RolloutGroup
 
 
 @torch.no_grad()
@@ -42,3 +47,57 @@ def generate_rollouts(input_prompt,
         })
 
     return rollouts
+
+
+def collect_rollout_groups(
+        task, input_prompt, behavior_policy,
+        tokenizer, score_fn,
+        *, group_id, run_epoch, source_learner_step,
+        attempt_id=0, num_gens=4, max_samples_per_gen=128,
+        eos_token_ids=(),
+) -> RolloutGroup:
+    """Generate and score responses to one unpadded prompt shaped [1, P].
+
+    score_fn(task, response_text) returns a scalar reward.
+    source_learner_step identifies the generator's loaded weights; the caller
+    must keep those weights unchanged throughout this call.
+    """
+    if input_prompt.ndim != 2 or input_prompt.shape[0] != 1 or input_prompt.shape[1] == 0:
+        raise ValueError("Expected one nonempty prompt with shape [1, P]")
+    if num_gens < 1 or max_samples_per_gen < 1:
+        raise ValueError("Generation count and response token limit must be positive")
+
+    created_at = time.time()
+    prompt_ids = input_prompt[0].tolist()
+    rollouts = generate_rollouts(
+        input_prompt,
+        behavior_policy,
+        num_gens=num_gens,
+        max_samples_per_gen=max_samples_per_gen,
+        eos_token_ids=eos_token_ids,
+    )
+
+    trajectories = []
+    for rollout in rollouts:
+        response_ids = rollout["response_ids"]
+        response_text = tokenizer.decode(response_ids, skip_special_tokens=True)
+        reward = float(score_fn(task, response_text))
+        if not math.isfinite(reward):
+            raise ValueError("Scorer returned a non-finite reward")
+        trajectories.append(Trajectory(
+            prompt_ids=prompt_ids,
+            response_ids=response_ids,
+            behavior_logprobs=rollout["behavior_logprobs"],
+            loss_mask=[True] * len(response_ids),
+            reward=reward,
+            finish_reason=rollout["finish_reason"],
+        ))
+
+    return RolloutGroup(
+        group_id=group_id,
+        attempt_id=attempt_id,
+        run_epoch=run_epoch,
+        source_learner_step=source_learner_step,
+        created_at=created_at,
+        trajectories=trajectories,
+    )
