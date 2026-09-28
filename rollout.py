@@ -10,7 +10,7 @@ from protocol import Trajectory, RolloutGroup
 def generate_rollouts(input_prompt,
                     behavior_policy,
                     num_gens=1,
-                    max_samples_per_gen=128,
+                    max_samples_per_gen=8192,
                     eos_token_ids=()):
 
     behavior_policy.eval()
@@ -101,3 +101,48 @@ def collect_rollout_groups(
         created_at=created_at,
         trajectories=trajectories,
     )
+
+
+# test generate_rollouts
+# check the output, thinking and rollout.
+# from datasets import load_dataset
+# from transformers import AutoTokenizer, AutoModelForCausalLM
+
+# model_name = "Qwen/Qwen3.5-4B"
+
+# # load the tokenizer and the model
+# tokenizer = AutoTokenizer.from_pretrained(model_name)
+# model = AutoModelForCausalLM.from_pretrained(
+#     model_name,
+#     torch_dtype="auto",
+#     device_map="auto"
+# )
+
+# music_tasks = load_dataset(
+#     "XiaomiMiMo/MiMo-V2.6-RL-oss",
+#     name="music",
+#     split="train",
+# )
+
+# for i in range(1):
+#     task = music_tasks[i]
+
+#     inp_prompt = tokenizer.apply_chat_template(
+#         task["prompt"],
+#         tokenize=True,
+#         add_generation_prompt=True,
+#         return_tensors="pt",
+#         return_dict=True,
+#     ).to("cuda")
+
+#     inp_prompt_detok = tokenizer.decode(inp_prompt["input_ids"])
+#     print(f"inp prompt {inp_prompt_detok}")
+
+#     rollout = generate_rollouts(
+#         inp_prompt["input_ids"],
+#         model,
+#         eos_token_ids=(model.generation_config.eos_token_id,)
+#     )
+
+#     detokenize = tokenizer.decode(rollout[0]['response_ids'])
+#     print(detokenize)
