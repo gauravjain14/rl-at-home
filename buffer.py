@@ -8,6 +8,9 @@ class BufferClosed(RuntimeError):
 
 class RolloutBuffer:
     def __init__(self, capacity: int, max_lag: int):
+        # capacity implies how many rollouts can be held
+        # before the trainer picks it up. If full, old
+        # entries are removed
         if capacity <= 0:
             raise ValueError("Capacity must be > 0")
         
