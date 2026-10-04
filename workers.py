@@ -14,6 +14,7 @@ class RolloutWorker:
             raise ValueError("score_fn must be callable")
 
         self.device = "cuda:0"
+        # initialize a copy of the model here which is then weight sync'd
         self.model = AutoModelForCausalLM.from_pretrained(
             model_name,
             dtype="auto",
@@ -48,8 +49,18 @@ class RolloutWorker:
         )
         return rollout_groups
 
+
+@ray.remote(num_cpus=1, num_gpus=1)
+class LearnerWorker:
+    def __init__(self, model, device, pad_token_id, learner_step=0):
+        self.model = model.to(device)
+        self.device = device
+        self.optimizer = torch.optim.SGD(self.model.parameters(), lr=1e-3)
+        self.pad_token_id = pad_token_id
+        self.learner_step = learner_step
+ 
     def train_groups(self, groups):
-        batch = collate_groups(groups, pad_token_id=0)
+        batch = collate_groups(groups, pad_token_id=self.pad_token_id)
         batch = {key: value.to(self.device) for key, value in batch.items()}
         
         # proximal policy my friends.
@@ -62,3 +73,6 @@ class RolloutWorker:
             batch=batch,
             proximal_logprobs=proximal_logprobs
         )
+
+        self.learner_step += 1
+        return metrics

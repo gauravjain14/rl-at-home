@@ -1,8 +1,9 @@
 """
 orchestrator of the behavior, learner, environments and verifier
 """
-
+import torch
 import asyncio
+import ray
 from datasets import load_dataset
 from transformers import AutoTokenizer, AutoModelForCausalLM
 
@@ -10,6 +11,8 @@ from learner import score_batch
 from batching import collate_groups
 from rollout import collect_rollout_groups
 from buffer import RolloutBuffer, BufferClosed
+from workers import RolloutWorker, LearnerWorker
+from mimo_music.pipeline import compute_score
 
 model_name = "Qwen/Qwen3.5-4B"
 
@@ -146,3 +149,23 @@ async def main(rollout_worker,
 
     result["buffer_stats"] = rollout_buffer.stats.copy()
     return result
+
+
+if __name__ == "__main__":
+    model_name = "Qwen/Qwen3.5-4B"
+    tokenizer = AutoTokenizer.from_pretrained(model_name)
+    model = AutoModelForCausalLM.from_pretrained(
+        model_name,
+        torch_dtype="auto"
+    )
+
+    ray.init()
+    learner_worker = LearnerWorker.remote(model=model,
+                                   device='cuda:0',
+                                   pad_token_id=0)
+    rollout_worker = RolloutWorker.remote(model_name=model_name,
+                                   score_fn=compute_score,
+                                   num_gens=4)
+    
+    asyncio.run(main(rollout_worker=rollout_worker, learner_worker=learner_worker))
+    ray.shutdown()                     
