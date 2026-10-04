@@ -124,17 +124,19 @@ def collect_rollout_groups(
 #     split="train",
 # )
 
-# for i in range(1):
+# for i in range(10):
 #     task = music_tasks[i]
 
 #     inp_prompt = tokenizer.apply_chat_template(
 #         task["prompt"],
 #         tokenize=True,
 #         add_generation_prompt=True,
+#         enable_thinking=True,
 #         return_tensors="pt",
 #         return_dict=True,
 #     ).to("cuda")
 
+#     print(f"Input ids ", inp_prompt["input_ids"])
 #     inp_prompt_detok = tokenizer.decode(inp_prompt["input_ids"])
 #     print(f"inp prompt {inp_prompt_detok}")
 
@@ -144,5 +146,7 @@ def collect_rollout_groups(
 #         eos_token_ids=(model.generation_config.eos_token_id,)
 #     )
 
+#     print(rollout)
+#     print(f"")
 #     detokenize = tokenizer.decode(rollout[0]['response_ids'])
 #     print(detokenize)

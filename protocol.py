@@ -4,8 +4,8 @@ class RolloutGroup:
     def __init__(self, group_id, attempt_id, run_epoch,
             source_learner_step, created_at, trajectories):
         """
-            source_learner_step: The learner step that the rollout group
-            was created at.
+            source_learner_step: The learner step represented by the
+            generator weights used for this rollout group.
         """
         self.group_id = group_id
         self.attempt_id = attempt_id
@@ -20,8 +20,7 @@ class Trajectory:
                  loss_mask, reward, finish_reason):
         self.prompt_ids = prompt_ids
         self.response_ids = response_ids
-        # not sure why they are called this but this is comparing
-        # trainer logprobs to the generator policy's logprobs.
+        # Generator logprobs of the sampled response tokens.
         self.behavior_logprobs = behavior_logprobs
         # loss_mask - which tokens contribute to the loss.
         self.loss_mask = loss_mask

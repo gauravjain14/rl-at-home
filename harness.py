@@ -22,8 +22,7 @@ model = Qwen2ForCausalLM(Qwen2Config(
 
 optimizer = torch.optim.SGD(model.parameters(), lr=1e-3)
 
-# source learner is step the step at which the trainer was when
-# the rollout group was first launched.
+# source_learner_step is the learner step represented by the generator's weights.
 rollout_group = RolloutGroup(
     group_id=0,
     attempt_id=0,
@@ -54,7 +53,7 @@ print("rewards ", batch["rewards"])
 print(f"group index", batch["group_index"])
 advantages = group_advantages(batch["rewards"], batch["group_index"])
 
-# learner's scores before the optimizer update (perhaps SFT policy?)
+# learner's frozen scores before the optimizer update (proximal policy)
 proximal_logprobs = current_logprobs.detach().clone()
 
 # Because I keep forgetting why the slicing is there - 

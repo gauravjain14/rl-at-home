@@ -54,6 +54,7 @@ async def learner_step(inp_buffer, learner_worker, num_train_steps=10,
 
 mimo_score_fn = None
 
+# hardcoded for mimo task
 def prepare_tasks(batch_size=16):
     tokenizer = AutoTokenizer.from_pretrained(model_name)
     music_tasks = load_dataset(
@@ -93,6 +94,7 @@ async def generate_rollouts(inputs,
             for task,inp_prompt in input_batch:
                 # collect_group wraps collect_rollout_groups inside the worker.
                 # That worker supplies its actual loaded source_learner_step.
+                # probably this might be a common entry point for other rollouts?
                 rollout_groups = await rollout_worker.collect_group.remote(
                     task=task,
                     input_prompt=inp_prompt["input_ids"],

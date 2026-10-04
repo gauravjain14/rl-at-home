@@ -7,7 +7,7 @@ def train_step(model, optimizer, batch, proximal_logprobs):
     """
         current logprobs - rollout tokens, logprobs from the current trainer policy
         behavior logprobs - logprobs recorded by the generator when sampling those tokens
-        proximal logprobs - logits from the rollouts, logprobs from the proximal policy
+        proximal logprobs - rollout tokens scored by the frozen proximal learner policy
         advantage - advantage from the rollouts
         loss_mask - mask of the rollouts
     """
