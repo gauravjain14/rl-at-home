@@ -48,6 +48,10 @@ class RolloutWorker:
             eos_token_ids=self.eos_token_ids,
         )
         return rollout_groups
+    
+    def load_weights(self):
+        
+        pass
 
 
 @ray.remote(num_cpus=1, num_gpus=1)

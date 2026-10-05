@@ -31,7 +31,8 @@ def load_model():
 # take the outputs from the rollout and put it in a buffer for the learner
 # to do the backward pass (or compute the loss if more information was needed)
 
-async def learner_step(inp_buffer, learner_worker, num_train_steps=10,
+async def learner_step(inp_buffer, learner_worker, rollout_worker,
+                       num_train_steps=10,
                        *, run_epoch=0, groups_per_batch=1):
     # learner runs. Start with 0th step
     step, metrics = 0, {}
@@ -49,7 +50,9 @@ async def learner_step(inp_buffer, learner_worker, num_train_steps=10,
 
         # The worker collates, scores the proximal policy, and updates once.
         metrics = await learner_worker.train_groups.remote(groups)
-        step += 1
+        # step finished, send weight updates.
+        ckpt_ref = learner_worker.export_weights.remote()
+        step = await rollout_worker.load_weights.remote(ckpt_ref)
         print({"learner_step": step, **metrics})
 
     return {"learner_step": step, "metrics": metrics}
@@ -58,28 +61,45 @@ async def learner_step(inp_buffer, learner_worker, num_train_steps=10,
 mimo_score_fn = None
 
 # hardcoded for mimo task
-def prepare_tasks(batch_size=16):
+def prepare_tasks(batch_size=16, task_name="music"):
     tokenizer = AutoTokenizer.from_pretrained(model_name)
-    music_tasks = load_dataset(
-        "XiaomiMiMo/MiMo-V2.6-RL-oss",
-        name="music",
-        split="train",
-    )
     inputs = []
-    for task in music_tasks:
-        inp_prompt = tokenizer.apply_chat_template(
-            task["prompt"],
-            tokenize=True,
-            add_generation_prompt=True,
-            return_tensors="pt",
-            return_dict=True,
-        )  # The rollout worker moves input_ids onto its own GPU.
-        
-        inputs.append((task, inp_prompt))
 
-        if len(inputs) == batch_size:
-            yield inputs
-            inputs = []
+    if task_name == "gsm8k":
+        dataset = load_dataset("openai/gsm8k", "main", split="train")
+        dataset = dataset.shuffle(seed=42)
+        # apply expected chat format on the dataset
+        for row in dataset:
+            task = {
+                "prompt": [{
+                    "role": "user",
+                    "content": (
+                        row["question"] 
+                        + "\nSolve step by step. On the last line, write #### followed by your numerical answer."
+                    )
+                }]
+            }
+    elif task_name == "music":
+        music_tasks = load_dataset(
+            "XiaomiMiMo/MiMo-V2.6-RL-oss",
+            name="music",
+            split="train",
+        )
+
+        for task in music_tasks:
+            inp_prompt = tokenizer.apply_chat_template(
+                task["prompt"],
+                tokenize=True,
+                add_generation_prompt=True,
+                return_tensors="pt",
+                return_dict=True,
+            )  # The rollout worker moves input_ids onto its own GPU.
+
+            inputs.append((task, inp_prompt))
+
+            if len(inputs) == batch_size:
+                yield inputs
+                inputs = []
 
     if inputs:
         yield inputs
@@ -137,6 +157,7 @@ async def main(rollout_worker,
             learner_step(
                 rollout_buffer,
                 learner_worker,
+                rollout_worker=rollout_worker,
                 num_train_steps=num_train_steps,
                 run_epoch=run_epoch,
                 groups_per_batch=groups_per_batch,
@@ -152,20 +173,21 @@ async def main(rollout_worker,
 
 
 if __name__ == "__main__":
-    model_name = "Qwen/Qwen3.5-4B"
+    #model_name = "Qwen/Qwen3.5-4B"
+    model_name = "Qwen/Qwen2.5-0.5B-Instruct"
     tokenizer = AutoTokenizer.from_pretrained(model_name)
     model = AutoModelForCausalLM.from_pretrained(
         model_name,
         torch_dtype="auto"
     )
 
-    ray.init()
-    learner_worker = LearnerWorker.remote(model=model,
-                                   device='cuda:0',
-                                   pad_token_id=0)
-    rollout_worker = RolloutWorker.remote(model_name=model_name,
-                                   score_fn=compute_score,
-                                   num_gens=4)
+    # ray.init()
+    # learner_worker = LearnerWorker.remote(model=model,
+    #                                device='cuda:0',
+    #                                pad_token_id=0)
+    # rollout_worker = RolloutWorker.remote(model_name=model_name,
+    #                                score_fn=compute_score,
+    #                                num_gens=4)
     
-    asyncio.run(main(rollout_worker=rollout_worker, learner_worker=learner_worker))
-    ray.shutdown()                     
+    # asyncio.run(main(rollout_worker=rollout_worker, learner_worker=learner_worker))
+    # ray.shutdown()                     
