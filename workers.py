@@ -1,5 +1,6 @@
 import torch
 import ray
+from pathlib import Path
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
 from rollout import collect_rollout_groups
@@ -14,11 +15,13 @@ class RolloutWorker:
             raise ValueError("score_fn must be callable")
 
         self.device = "cuda:0"
+        torch.manual_seed(42)
         # initialize a copy of the model here which is then weight sync'd
         self.model = AutoModelForCausalLM.from_pretrained(
             model_name,
-            dtype="auto",
+            dtype=torch.float32,
             device_map={"": self.device},
+            attn_implementation="sdpa",
         )
         self.model.eval()
         self.tokenizer = AutoTokenizer.from_pretrained(model_name)
@@ -49,17 +52,49 @@ class RolloutWorker:
         )
         return rollout_groups
     
-    def load_weights(self):
-        
-        pass
+    @torch.no_grad()
+    def load_weights(self, snapshot):
+        version = snapshot["learner_step"]
+        if version < self.policy_version:
+            raise ValueError("Cannot load an older policy")
+        # Ordinary Ray actor methods are serial: no collect_group runs here.
+        torch.cuda.synchronize(self.device)
+        self.model.load_state_dict(snapshot["state_dict"], strict=True)
+        torch.cuda.synchronize(self.device)
+        self.policy_version = version
+        return self.policy_version
+
+    @torch.no_grad()
+    def evaluate(self, inputs, max_samples_per_gen=512):
+        if not inputs:
+            raise ValueError("Evaluation needs at least one prompt")
+        rewards, truncated = [], 0
+        for task, inp_prompt in inputs:
+            prompt = {key: value.to(self.device) for key, value in inp_prompt.items()}
+            output = self.model.generate(
+                **prompt, do_sample=False, max_new_tokens=max_samples_per_gen,
+                repetition_penalty=1.0,
+                pad_token_id=self.tokenizer.pad_token_id,
+                eos_token_id=list(self.eos_token_ids),
+            )
+            response_ids = output[0, prompt["input_ids"].shape[1]:].tolist()
+            text = self.tokenizer.decode(response_ids, skip_special_tokens=True)
+            rewards.append(float(self.score_fn(task, text)))
+            truncated += not response_ids or response_ids[-1] not in self.eos_token_ids
+        return {
+            "accuracy": sum(rewards) / len(rewards),
+            "truncated_fraction": truncated / len(rewards),
+            "num_examples": len(rewards),
+            "policy_version": self.policy_version,
+        }
 
 
 @ray.remote(num_cpus=1, num_gpus=1)
 class LearnerWorker:
     def __init__(self, model, device, pad_token_id, learner_step=0):
-        self.model = model.to(device)
+        self.model = model.to(device=device, dtype=torch.float32).eval()
         self.device = device
-        self.optimizer = torch.optim.SGD(self.model.parameters(), lr=1e-3)
+        self.optimizer = torch.optim.AdamW(self.model.parameters(), lr=1e-6, weight_decay=0.0)
         self.pad_token_id = pad_token_id
         self.learner_step = learner_step
  
@@ -78,5 +113,36 @@ class LearnerWorker:
             proximal_logprobs=proximal_logprobs
         )
 
+        trajectories = [trajectory for group in groups for trajectory in group.trajectories]
+        metrics.update({
+            "reward_mean": batch["rewards"].mean().item(),
+            "equal_reward_group_fraction": sum(
+                len({trajectory.reward for trajectory in group.trajectories}) == 1
+                for group in groups
+            ) / len(groups),
+            "truncated_fraction": sum(
+                trajectory.finish_reason == "length" for trajectory in trajectories
+            ) / len(trajectories),
+            "policy_lag_max": max(self.learner_step - group.source_learner_step for group in groups),
+        })
         self.learner_step += 1
         return metrics
+
+    def export_weights(self):
+        return {
+            "learner_step": self.learner_step,
+            "state_dict": {
+                name: tensor.detach().to("cpu", copy=True)
+                for name, tensor in self.model.state_dict().items()
+            },
+        }
+
+    def save_checkpoint(self, path):
+        path = Path(path)
+        path.mkdir(parents=True, exist_ok=False)
+        self.model.save_pretrained(path)
+        torch.save({
+            "learner_step": self.learner_step,
+            "optimizer": self.optimizer.state_dict(),
+        }, path / "trainer.pt")
+        return str(path)

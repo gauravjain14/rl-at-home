@@ -1,6 +1,6 @@
 import asyncio
 import unittest
-from unittest.mock import Mock, patch
+from unittest.mock import AsyncMock, Mock, patch
 
 import driver
 from protocol import RolloutGroup
@@ -14,13 +14,34 @@ class DriverTests(unittest.IsolatedAsyncioTestCase):
     async def drive(self, count, generate, train, **kwargs):
         prepared = [(i, {"input_ids": [[i]]}) for i in range(count)]
         inputs = [prepared[i:i + 2] for i in range(0, count, 2)]
-        rollout_worker = Mock(collect_group=Mock(remote=generate))
-        learner_worker = Mock(train_groups=Mock(remote=train))
+        version = 0
+
+        async def update(groups):
+            nonlocal version
+            metrics = await train(groups)
+            version += 1
+            return metrics
+
+        async def load(snapshot):
+            self.assertEqual(snapshot["learner_step"], version)
+            return version
+
+        rollout_worker = Mock(
+            collect_group=Mock(remote=generate), load_weights=Mock(remote=AsyncMock(side_effect=load)),
+            evaluate=Mock(remote=AsyncMock(side_effect=lambda *args: {"policy_version": version})),
+        )
+        learner_worker = Mock(
+            train_groups=Mock(remote=update),
+            export_weights=Mock(remote=lambda: {"learner_step": version}),
+            save_checkpoint=Mock(remote=AsyncMock(side_effect=lambda path: path)),
+        )
         with patch.object(driver, "prepare_tasks", return_value=iter(inputs)), \
                 patch("builtins.print"):
-            return await asyncio.wait_for(
+            result = await asyncio.wait_for(
                 driver.main(rollout_worker, learner_worker, **kwargs), 2,
             )
+        self.assertEqual(rollout_worker.load_weights.remote.await_count, version + 1)
+        return result
 
     async def test_group_delivery_partial_batch_and_empty_input(self):
         for count in (0, 5):
@@ -29,7 +50,7 @@ class DriverTests(unittest.IsolatedAsyncioTestCase):
 
                 async def generate(**kwargs):
                     self.assertEqual(kwargs["input_prompt"], [[kwargs["task"]]])
-                    self.assertEqual(kwargs["max_samples_per_gen"], 1024)
+                    self.assertEqual(kwargs["max_samples_per_gen"], 512)
                     return await collect(**kwargs)
 
                 async def train(groups):
@@ -44,6 +65,15 @@ class DriverTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(result["learner_step"], len(batches))
                 self.assertEqual(result["metrics"], {"batch_size": 1} if count else {})
                 self.assertEqual(result["buffer_stats"]["accepted"], count)
+
+    async def test_evaluation_uses_initial_and_final_synced_versions(self):
+        result = await self.drive(
+            2, collect, AsyncMock(return_value={"loss": 0.5}),
+            eval_inputs=["held-out prompt"], checkpoint_dir="test-checkpoint",
+        )
+        self.assertEqual(result["eval_before"]["policy_version"], 0)
+        self.assertEqual(result["eval_after"]["policy_version"], 2)
+        self.assertEqual(result["checkpoint_dir"], "test-checkpoint")
 
     async def test_overlap_and_policy_staleness(self):
         training, generated = asyncio.Event(), asyncio.Event()
