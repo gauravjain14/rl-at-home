@@ -13,6 +13,7 @@ def train_step(model, optimizer, batch, proximal_logprobs):
     """
     optimizer.zero_grad()
 
+    # current policy logprobs on the trainer
     current_logprobs = score_batch(model, batch)
     advantages = group_advantages(
         batch["rewards"],

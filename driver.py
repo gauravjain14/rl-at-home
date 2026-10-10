@@ -14,7 +14,7 @@ from learner import score_batch
 from batching import collate_groups
 from rollout import collect_rollout_groups
 from buffer import RolloutBuffer, BufferClosed
-from workers import RolloutWorker, LearnerWorker
+from workers import RolloutWorker, LearnerWorker, SyncWorker
 from mimo_music.pipeline import compute_score
 from gsm8k import gsm8k_score_fn
 
@@ -76,9 +76,12 @@ def prepare_tasks(batch_size=16, task_name="gsm8k", *, split="train", limit=None
         if split == "train":
             dataset = dataset.shuffle(seed=42)
         # apply expected chat format on the dataset
+        print(dataset[0])
         for index, row in enumerate(dataset):
             if limit is not None and index >= limit:
                 break
+            # just maintains music-style task formating
+            # I don't think this approach is scalable though
             task = {
                 "prompt": [{
                     "role": "user",
@@ -157,9 +160,8 @@ async def generate_rollouts(inputs,
         await rollout_buffer.close()
 
 
-# orchestrator
-async def main(rollout_worker,
-               learner_worker,
+# sync workers
+async def main(sync_worker,
                *,
                num_train_steps=100,
                groups_per_batch=1,
@@ -171,75 +173,132 @@ async def main(rollout_worker,
     if num_train_steps < 1 or groups_per_batch < 1:
         raise ValueError("Step count and groups_per_batch must be positive")
 
-    rollout_buffer = RolloutBuffer(capacity=16, max_lag=2)
-
-    # Start both workers from the exact same learner snapshot.
-    await rollout_worker.load_weights.remote(learner_worker.export_weights.remote())
     before = None
     if eval_inputs is not None:
-        before = await rollout_worker.evaluate.remote(eval_inputs, max_samples_per_gen)
+        before = await sync_worker.evaluate.remote(eval_inputs, max_samples_per_gen)
         print({"eval_before": before})
 
-    async with asyncio.TaskGroup() as tasks:
-        rollout_producer = tasks.create_task(
-            generate_rollouts(
-                prepare_tasks(batch_size=16, task_name=task_name),
-                rollout_worker,
-                rollout_buffer,
+    step = 0
+    group_id = 0
+    metrics = {}
+    for input_batch in prepare_tasks(batch_size=groups_per_batch, task_name=task_name):
+        groups = []
+        for task, inp_prompt in input_batch:
+            group = await sync_worker.collect_group.remote(
+                task=task,
+                input_prompt=inp_prompt["input_ids"],
+                group_id=group_id,
                 run_epoch=run_epoch,
                 max_samples_per_gen=max_samples_per_gen,
             )
-        )
-        learner_consumer = tasks.create_task(
-            learner_step(
-                rollout_buffer,
-                learner_worker,
-                rollout_worker=rollout_worker,
-                num_train_steps=num_train_steps,
-                run_epoch=run_epoch,
-                groups_per_batch=groups_per_batch,
-            )
-        )
+            groups.append(group)
+            group_id += 1
 
-        result = await learner_consumer
-        # Stop this local request loop; remote-job shutdown belongs to workers.
-        rollout_producer.cancel()
+        metrics = await sync_worker.train_groups.remote(groups)
+        step += 1
+        print({"learner_step": step, **metrics})
+        if step >= num_train_steps:
+            break
 
-    result["buffer_stats"] = rollout_buffer.stats.copy()
+    result = {"learner_step": step, "metrics": metrics}
     if eval_inputs is not None:
         result["eval_before"] = before
-        result["eval_after"] = await rollout_worker.evaluate.remote(eval_inputs, max_samples_per_gen)
+        result["eval_after"] = await sync_worker.evaluate.remote(eval_inputs, max_samples_per_gen)
         print({"eval_after": result["eval_after"]})
     if checkpoint_dir is not None:
-        result["checkpoint_dir"] = await learner_worker.save_checkpoint.remote(str(checkpoint_dir))
+        result["checkpoint_dir"] = await sync_worker.save_checkpoint.remote(str(checkpoint_dir))
     return result
+
+
+# orchestrator
+# async def main(rollout_worker,
+#                learner_worker,
+#                *,
+#                num_train_steps=100,
+#                groups_per_batch=1,
+#                run_epoch=0,
+#                task_name="gsm8k",
+#                max_samples_per_gen=512,
+#                eval_inputs=None,
+#                checkpoint_dir=None):
+#     if num_train_steps < 1 or groups_per_batch < 1:
+#         raise ValueError("Step count and groups_per_batch must be positive")
+
+#     rollout_buffer = RolloutBuffer(capacity=16, max_lag=2)
+
+#     # Start both workers from the exact same learner snapshot.
+#     await rollout_worker.load_weights.remote(learner_worker.export_weights.remote())
+#     before = None
+#     if eval_inputs is not None:
+#         before = await rollout_worker.evaluate.remote(eval_inputs, max_samples_per_gen)
+#         print({"eval_before": before})
+
+#     async with asyncio.TaskGroup() as tasks:
+#         rollout_producer = tasks.create_task(
+#             generate_rollouts(
+#                 prepare_tasks(batch_size=16, task_name=task_name),
+#                 rollout_worker,
+#                 rollout_buffer,
+#                 run_epoch=run_epoch,
+#                 max_samples_per_gen=max_samples_per_gen,
+#             )
+#         )
+#         learner_consumer = tasks.create_task(
+#             learner_step(
+#                 rollout_buffer,
+#                 learner_worker,
+#                 rollout_worker=rollout_worker,
+#                 num_train_steps=num_train_steps,
+#                 run_epoch=run_epoch,
+#                 groups_per_batch=groups_per_batch,
+#             )
+#         )
+
+#         result = await learner_consumer
+#         # Stop this local request loop; remote-job shutdown belongs to workers.
+#         rollout_producer.cancel()
+
+#     result["buffer_stats"] = rollout_buffer.stats.copy()
+#     if eval_inputs is not None:
+#         result["eval_before"] = before
+#         result["eval_after"] = await rollout_worker.evaluate.remote(eval_inputs, max_samples_per_gen)
+#         print({"eval_after": result["eval_after"]})
+#     if checkpoint_dir is not None:
+#         result["checkpoint_dir"] = await learner_worker.save_checkpoint.remote(str(checkpoint_dir))
+#     return result
 
 
 if __name__ == "__main__":
     ray.init()
     try:
-        if ray.cluster_resources().get("GPU", 0) < 2:
-            raise RuntimeError("This two-worker driver requires two GPUs (one per worker).")
+        if ray.cluster_resources().get("GPU", 0) < 1:
+            raise RuntimeError("SyncWorker requires one available GPU.")
         tokenizer = AutoTokenizer.from_pretrained(model_name)
         if tokenizer.pad_token_id is None:
             tokenizer.pad_token = tokenizer.eos_token
         model = AutoModelForCausalLM.from_pretrained(
             model_name, dtype=torch.float32, attn_implementation="sdpa",
         )
-        learner_worker = LearnerWorker.remote(
+        sync_worker = SyncWorker.remote(
             model=model, device="cuda:0", pad_token_id=tokenizer.pad_token_id,
+            tokenizer=tokenizer, score_fn=gsm8k_score_fn
         )
-        del model  # Ray owns the submitted argument; release the driver's copy.
-        rollout_worker = RolloutWorker.remote(
-            model_name=model_name, score_fn=gsm8k_score_fn, num_gens=4,
-        )
+        del model  # Release the driver's CPU copy after submitting it to Ray.
+        # learner_worker = LearnerWorker.remote(
+        #     model=model, device="cuda:0", pad_token_id=tokenizer.pad_token_id,
+        # )
+        # del model
+        # rollout_worker = RolloutWorker.remote(
+        #     model_name=model_name, score_fn=gsm8k_score_fn, num_gens=4,
+        # )
         eval_inputs = [
-            entry for batch in prepare_tasks(task_name="gsm8k", split="test", limit=128)
+            entry for batch in prepare_tasks(task_name="gsm8k", split="test", limit=8)
             for entry in batch
         ]
         checkpoint_dir = Path("checkpoints") / f"gsm8k-{time.time_ns()}"
         result = asyncio.run(main(
-            rollout_worker=rollout_worker, learner_worker=learner_worker,
+            sync_worker=sync_worker,
+            num_train_steps=2,
             task_name="gsm8k", eval_inputs=eval_inputs, checkpoint_dir=checkpoint_dir,
         ))
         tokenizer.save_pretrained(checkpoint_dir)

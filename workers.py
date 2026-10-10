@@ -9,6 +9,113 @@ from learner import train_step, score_batch
 
 
 @ray.remote(num_cpus=1, num_gpus=1)
+class SyncWorker:
+    # what is needed for the sync worker?
+    # model, optimizer, etc.
+    # the rollout worker collects the rollout groups, load
+    # weights and gets the policy version. rollout
+    # also runs the evals
+    def __init__(self, model, device, pad_token_id, learner_step=0,
+                 *, tokenizer, score_fn, num_gens=4):
+        if not callable(score_fn):
+            raise ValueError("score_fn must be callable")
+
+        self.model = model.to(device=device, dtype=torch.float32).eval()
+        self.device = device
+        self.optimizer = torch.optim.AdamW(self.model.parameters(), lr=1e-6, weight_decay=0.0)
+        self.pad_token_id = pad_token_id
+        self.learner_step = learner_step
+        self.tokenizer = tokenizer
+        self.score_fn = score_fn
+        self.num_gens = num_gens
+
+        eos = self.model.generation_config.eos_token_id
+        if eos is None:
+            eos = self.tokenizer.eos_token_id
+        self.eos_token_ids = (eos,) if isinstance(eos, int) else tuple(eos or ())
+
+    def train_groups(self, groups):
+        # collate the groups and do a trainer step
+        batch = collate_groups(groups, pad_token_id=self.pad_token_id)
+        batch = {key: value.to(self.device) for key, value in batch.items()}
+
+        with torch.no_grad():
+            proximal_logprobs = score_batch(self.model, batch)
+
+        metrics = train_step(
+            model=self.model,
+            optimizer=self.optimizer,
+            batch=batch,
+            proximal_logprobs=proximal_logprobs
+        )
+        trajectories = [trajectory for group in groups for trajectory in group.trajectories]
+        metrics.update({
+            "reward_mean": batch["rewards"].mean().item(),
+            "equal_reward_group_fraction": sum(
+                len({trajectory.reward for trajectory in group.trajectories}) == 1
+                for group in groups
+            ) / len(groups),
+            "truncated_fraction": sum(
+                trajectory.finish_reason == "length" for trajectory in trajectories
+            ) / len(trajectories),
+            "policy_lag_max": max(self.learner_step - group.source_learner_step for group in groups),
+        })
+        self.learner_step += 1
+        return metrics
+
+    def collect_group(self, task, input_prompt, *, group_id, run_epoch,
+                      max_samples_per_gen=1024):
+        rollout_groups = collect_rollout_groups(
+            task=task,
+            input_prompt=input_prompt.to(self.device),
+            behavior_policy=self.model,
+            tokenizer=self.tokenizer,
+            score_fn=self.score_fn,
+            group_id=group_id,
+            run_epoch=run_epoch,
+            source_learner_step=self.learner_step,
+            num_gens=self.num_gens,
+            max_samples_per_gen=max_samples_per_gen,
+            eos_token_ids=self.eos_token_ids,
+        )
+        return rollout_groups
+
+    @torch.no_grad()
+    def evaluate(self, inputs, max_samples_per_gen=512):
+        if not inputs:
+            raise ValueError("Evaluation needs at least one prompt")
+        rewards, truncated = [], 0
+        for task, inp_prompt in inputs:
+            prompt = {key: value.to(self.device) for key, value in inp_prompt.items()}
+            output = self.model.generate(
+                **prompt, do_sample=False, max_new_tokens=max_samples_per_gen,
+                repetition_penalty=1.0,
+                pad_token_id=self.pad_token_id,
+                eos_token_id=list(self.eos_token_ids),
+            )
+            response_ids = output[0, prompt["input_ids"].shape[1]:].tolist()
+            text = self.tokenizer.decode(response_ids, skip_special_tokens=True)
+            rewards.append(float(self.score_fn(task, text)))
+            truncated += not response_ids or response_ids[-1] not in self.eos_token_ids
+        return {
+            "accuracy": sum(rewards) / len(rewards),
+            "truncated_fraction": truncated / len(rewards),
+            "num_examples": len(rewards),
+            "policy_version": self.learner_step,
+        }
+
+    def save_checkpoint(self, path):
+        path = Path(path)
+        path.mkdir(parents=True, exist_ok=False)
+        self.model.save_pretrained(path)
+        torch.save({
+            "learner_step": self.learner_step,
+            "optimizer": self.optimizer.state_dict(),
+        }, path / "trainer.pt")
+        return str(path)
+
+
+@ray.remote(num_cpus=1, num_gpus=1)
 class RolloutWorker:
     def __init__(self, model_name, score_fn, num_gens=4):
         if not callable(score_fn):
