@@ -298,7 +298,7 @@ if __name__ == "__main__":
         checkpoint_dir = Path("checkpoints") / f"gsm8k-{time.time_ns()}"
         result = asyncio.run(main(
             sync_worker=sync_worker,
-            num_train_steps=2,
+            num_train_steps=10,
             task_name="gsm8k", eval_inputs=eval_inputs, checkpoint_dir=checkpoint_dir,
         ))
         tokenizer.save_pretrained(checkpoint_dir)

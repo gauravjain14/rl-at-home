@@ -16,7 +16,7 @@ class SyncWorker:
     # weights and gets the policy version. rollout
     # also runs the evals
     def __init__(self, model, device, pad_token_id, learner_step=0,
-                 *, tokenizer, score_fn, num_gens=4):
+                 *, tokenizer, score_fn, num_gens=2):
         if not callable(score_fn):
             raise ValueError("score_fn must be callable")
 
