@@ -90,6 +90,22 @@ class TrainStepTests(unittest.TestCase):
         self.optimizer.step.assert_not_called()
         torch.testing.assert_close(self.model.logits, before, rtol=0, atol=0)
 
+    def test_microbatches_match_full_batch_with_unequal_lengths(self):
+        batch = {key: value[[0, 1, 0]] for key, value in self.batch.items()}
+        proximal = self.proximal[[0, 1, 0]]
+        results = []
+        for size in (3, 1, 2):
+            model = TinyPolicy()
+            optimizer = torch.optim.SGD(model.parameters(), lr=.001)
+            metrics = train_step(model, optimizer, batch, proximal, micro_batch_size=size)
+            results.append((model.logits.detach().clone(), model.logits.grad.clone(), metrics))
+        expected_weights, expected_grad, expected_metrics = results[0]
+        for weights, grad, metrics in results[1:]:
+            torch.testing.assert_close(weights, expected_weights)
+            torch.testing.assert_close(grad, expected_grad)
+            self.assertAlmostEqual(metrics["loss"], expected_metrics["loss"], places=6)
+            self.assertAlmostEqual(metrics["grad_norm"], expected_metrics["grad_norm"], places=5)
+
 
 if __name__ == "__main__":
     unittest.main()
