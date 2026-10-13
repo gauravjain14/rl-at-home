@@ -169,7 +169,8 @@ async def main(sync_worker,
                task_name="gsm8k",
                max_samples_per_gen=512,
                eval_inputs=None,
-               checkpoint_dir=None):
+               checkpoint_dir=None,
+               wandb_run=None):
     if num_train_steps < 1 or groups_per_batch < 1:
         raise ValueError("Step count and groups_per_batch must be positive")
 
@@ -177,6 +178,11 @@ async def main(sync_worker,
     if eval_inputs is not None:
         before = await sync_worker.evaluate.remote(eval_inputs, max_samples_per_gen)
         print({"eval_before": before})
+        if wandb_run is not None:
+            wandb_run.log({
+                "learner_step": 0,
+                **{f"eval/{key}": value for key, value in before.items()},
+            })
 
     step = 0
     group_id = 0
@@ -197,6 +203,11 @@ async def main(sync_worker,
         metrics = await sync_worker.train_groups.remote(groups)
         step += 1
         print({"learner_step": step, **metrics})
+        if wandb_run is not None:
+            wandb_run.log({
+                "learner_step": step,
+                **{f"train/{key}": value for key, value in metrics.items()},
+            })
         if step >= num_train_steps:
             break
 
@@ -205,6 +216,11 @@ async def main(sync_worker,
         result["eval_before"] = before
         result["eval_after"] = await sync_worker.evaluate.remote(eval_inputs, max_samples_per_gen)
         print({"eval_after": result["eval_after"]})
+        if wandb_run is not None:
+            wandb_run.log({
+                "learner_step": step,
+                **{f"eval/{key}": value for key, value in result["eval_after"].items()},
+            })
     if checkpoint_dir is not None:
         result["checkpoint_dir"] = await sync_worker.save_checkpoint.remote(str(checkpoint_dir))
     return result
@@ -269,6 +285,8 @@ async def main(sync_worker,
 
 
 if __name__ == "__main__":
+    import wandb
+
     ray.init()
     try:
         if ray.cluster_resources().get("GPU", 0) < 1:
@@ -296,11 +314,20 @@ if __name__ == "__main__":
             for entry in batch
         ]
         checkpoint_dir = Path("checkpoints") / f"gsm8k-{time.time_ns()}"
-        result = asyncio.run(main(
-            sync_worker=sync_worker,
-            num_train_steps=10,
-            task_name="gsm8k", eval_inputs=eval_inputs, checkpoint_dir=checkpoint_dir,
-        ))
+        with wandb.init(
+            entity="scratchpad",
+            project="nanoRL",
+            config={"model": model_name, "task": "gsm8k"},
+        ) as run:
+            run.define_metric("learner_step")
+            run.define_metric("train/*", step_metric="learner_step")
+            run.define_metric("eval/*", step_metric="learner_step")
+            result = asyncio.run(main(
+                sync_worker=sync_worker,
+                num_train_steps=100,
+                task_name="gsm8k", eval_inputs=eval_inputs, checkpoint_dir=checkpoint_dir,
+                wandb_run=run,
+            ))
         tokenizer.save_pretrained(checkpoint_dir)
         with (checkpoint_dir / "run_metrics.json").open("w") as output:
             json.dump(result, output, indent=2)
