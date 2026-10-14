@@ -1,14 +1,17 @@
 import asyncio
+import json
+import tempfile
 import unittest
+from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, Mock, patch
 
 import driver
 from protocol import RolloutGroup
 
 
 class DriverTests(unittest.IsolatedAsyncioTestCase):
-    async def drive(self, count, **kwargs):
+    async def drive(self, count, *, eval_fail_at=None, **kwargs):
         events, version = [], 0
 
         async def collect(**args):
@@ -27,12 +30,19 @@ class DriverTests(unittest.IsolatedAsyncioTestCase):
             version += 1
             return {"batch_size": len(groups)}
 
-        async def evaluate(*args):
+        async def evaluate(*args, **options):
             events.append(("evaluate", version))
-            return {"policy_version": version}
+            self.assertIs(args[0], kwargs["eval_inputs"])
+            if version == eval_fail_at:
+                raise RuntimeError("evaluation failed")
+            scores = {"policy_version": version, "accuracy": 0.9 if version == 2 else 0.5}
+            if options.get("output_path"):
+                Path(options["output_path"]).write_text(json.dumps(scores))
+            return scores
 
         async def save(path):
             events.append(("save", version))
+            Path(path).mkdir(parents=True, exist_ok=False)
             return path
 
         worker = SimpleNamespace(**{
@@ -41,7 +51,7 @@ class DriverTests(unittest.IsolatedAsyncioTestCase):
                 ("evaluate", evaluate), ("save_checkpoint", save),
             )
         })  # Deliberately has no export_weights or load_weights.
-        size = kwargs.get("groups_per_batch", 1)
+        size = kwargs.get("groups_per_batch", 16)
         prepared = [(i, {"input_ids": [[i]]}) for i in range(count)]
         inputs = [prepared[i:i + size] for i in range(0, count, size)]
         with patch.object(driver, "prepare_tasks", return_value=iter(inputs)) as prepare, \
@@ -68,16 +78,59 @@ class DriverTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(result["metrics"], {"batch_size": len(batches[-1])} if batches else {})
 
     async def test_evaluation_and_checkpoint_order(self):
-        result, events = await self.drive(
-            3, num_train_steps=2, eval_inputs=["held-out"], checkpoint_dir="test-checkpoint",
-        )
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / "run"
+            result, events = await self.drive(
+                3, num_train_steps=2, groups_per_batch=1,
+                eval_inputs=[({"question_id": 7}, {})], checkpoint_dir=root,
+            )
+            self.assertEqual(result["checkpoint_dir"], str(root / "step-000002"))
+            self.assertEqual(json.loads((root / "validation_ids.json").read_text()), [7])
         self.assertEqual(events, [
             ("evaluate", 0), ("collect", 0, 0), ("train", [0], 0),
-            ("collect", 1, 1), ("train", [1], 1), ("evaluate", 2), ("save", 2),
+            ("collect", 1, 1), ("train", [1], 1), ("save", 2), ("evaluate", 2),
         ])
         self.assertEqual(result["eval_before"]["policy_version"], 0)
         self.assertEqual(result["eval_after"]["policy_version"], 2)
-        self.assertEqual(result["checkpoint_dir"], "test-checkpoint")
+
+    async def test_periodic_final_retention_and_logging(self):
+        for count in (6, 7):
+            with self.subTest(count=count), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory) / "run"
+                run = SimpleNamespace(log=Mock())
+                result, events = await self.drive(
+                    count, num_train_steps=None, groups_per_batch=1, checkpoint_every=2,
+                    eval_inputs=[({"question_id": 7}, {})], checkpoint_dir=root, wandb_run=run,
+                )
+                steps = [2, 4, 6] + ([7] if count == 7 else [])
+                expected = [("evaluate", 0)]
+                for step in steps:
+                    expected.extend([("save", step), ("evaluate", step)])
+                self.assertEqual([event for event in events if event[0] in ("save", "evaluate")], expected)
+                kept = {2, *steps[-2:]}
+                self.assertEqual({path.name for path in root.glob("step-*")},
+                                 {f"step-{step:06d}" for step in kept})
+                self.assertEqual(result["best_checkpoint_dir"], str(root / "step-000002"))
+                self.assertEqual(result["eval_after"]["policy_version"], count)
+                self.assertEqual(len(list(root.glob("eval-*.json"))), len(steps) + 1)
+                logged_evals = [call.args[0]["learner_step"] for call in run.log.call_args_list
+                                if "eval/accuracy" in call.args[0]]
+                self.assertEqual(logged_evals, [0, *steps])
+
+    async def test_default_sixteen_prompt_batch_and_partial_tail(self):
+        result, events = await self.drive(17, num_train_steps=None)
+        trained = [event[1] for event in events if event[0] == "train"]
+        self.assertEqual(trained, [list(range(16)), [16]])
+        self.assertEqual(result["learner_step"], 2)
+
+    async def test_checkpoint_survives_evaluation_failure(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / "run"
+            with self.assertRaisesRegex(RuntimeError, "evaluation failed"):
+                await self.drive(2, num_train_steps=None, groups_per_batch=1, checkpoint_every=2,
+                                 eval_inputs=[({"question_id": 7}, {})], checkpoint_dir=root,
+                                 eval_fail_at=2)
+            self.assertTrue((root / "step-000002" / "run_config.json").is_file())
 
     async def test_failures_stop_the_run(self):
         for stage in ("collect_group", "train_groups"):
@@ -89,7 +142,7 @@ class DriverTests(unittest.IsolatedAsyncioTestCase):
                 getattr(worker, stage).remote.side_effect = RuntimeError(stage)
                 with patch.object(driver, "prepare_tasks", return_value=[[({}, {"input_ids": None})]]):
                     with self.assertRaisesRegex(RuntimeError, stage):
-                        await driver.main(worker, checkpoint_dir="unused")
+                        await driver.main(worker)
                 worker.save_checkpoint.remote.assert_not_awaited()
                 if stage == "collect_group":
                     worker.train_groups.remote.assert_not_awaited()

@@ -60,9 +60,11 @@ class TrainStepTests(unittest.TestCase):
         with torch.no_grad():
             self.proximal = score_batch(self.model, self.batch)
         self.batch["behavior_logprobs"] = torch.cat([torch.zeros(2, 1), self.proximal.clone()], dim=1)
+        self.step_grad_norms = []
 
     @torch.no_grad()
     def sgd_step(self):
+        self.step_grad_norms.append(self.model.logits.grad.norm().item())
         self.model.logits.add_(self.model.logits.grad, alpha=-.001)
 
     def test_updates_clear_gradients_and_preserve_proximal(self):
@@ -79,7 +81,16 @@ class TrainStepTests(unittest.TestCase):
                 self.assertTrue(torch.isfinite(torch.tensor(metrics[key])))
             if step_count == 1:
                 self.assertGreater(metrics["grad_norm"], 1.)
-            self.assertLessEqual(self.model.logits.grad.norm().item(), 1.00001)
+            self.assertLessEqual(self.step_grad_norms[-1], 1.00001)
+            self.assertIsNone(self.model.logits.grad)
+
+    def test_equal_rewards_skip_the_optimizer(self):
+        self.batch["rewards"] = torch.tensor([1., 1.])
+        before = self.model.logits.detach().clone()
+        metrics = train_step(self.model, self.optimizer, self.batch, self.proximal)
+        self.assertEqual(metrics, {"loss": 0.0, "grad_norm": 0.0})
+        self.optimizer.step.assert_not_called()
+        torch.testing.assert_close(self.model.logits, before, rtol=0, atol=0)
 
     def test_nonfinite_gradient_rejects_before_optimizer(self):
         before = self.model.logits.detach().clone()
@@ -97,8 +108,10 @@ class TrainStepTests(unittest.TestCase):
         for size in (3, 1, 2):
             model = TinyPolicy()
             optimizer = torch.optim.SGD(model.parameters(), lr=.001)
+            gradients = []
+            optimizer.register_step_pre_hook(lambda opt, args, kwargs: gradients.append(model.logits.grad.clone()))
             metrics = train_step(model, optimizer, batch, proximal, micro_batch_size=size)
-            results.append((model.logits.detach().clone(), model.logits.grad.clone(), metrics))
+            results.append((model.logits.detach().clone(), gradients[0], metrics))
         expected_weights, expected_grad, expected_metrics = results[0]
         for weights, grad, metrics in results[1:]:
             torch.testing.assert_close(weights, expected_weights)

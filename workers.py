@@ -1,3 +1,4 @@
+import json
 import torch
 import ray
 from pathlib import Path
@@ -16,18 +17,20 @@ class SyncWorker:
     # weights and gets the policy version. rollout
     # also runs the evals
     def __init__(self, model, device, pad_token_id, learner_step=0,
-                 *, tokenizer, score_fn, num_gens=4):
+                 *, tokenizer, score_fn, num_gens=8, answer_parser=None, lr=1e-6,
+                 seed=42):
         if not callable(score_fn):
             raise ValueError("score_fn must be callable")
 
-        torch.manual_seed(42)
+        torch.manual_seed(seed)
         self.model = model.to(device=device, dtype=torch.float32).eval()
         self.device = device
-        self.optimizer = torch.optim.AdamW(self.model.parameters(), lr=1e-6, weight_decay=0.0)
+        self.optimizer = torch.optim.AdamW(self.model.parameters(), lr=lr, weight_decay=0.0)
         self.pad_token_id = pad_token_id
         self.learner_step = learner_step
         self.tokenizer = tokenizer
         self.score_fn = score_fn
+        self.answer_parser = answer_parser
         self.num_gens = num_gens
 
         eos = self.model.generation_config.eos_token_id
@@ -57,6 +60,8 @@ class SyncWorker:
             proximal_logprobs=proximal_logprobs
         )
         trajectories = [trajectory for group in groups for trajectory in group.trajectories]
+        mask = batch["loss_mask"][:, 1:]
+        behavior = batch["behavior_logprobs"][:, 1:][mask]
         metrics.update({
             "reward_mean": batch["rewards"].mean().item(),
             "equal_reward_group_fraction": sum(
@@ -67,6 +72,11 @@ class SyncWorker:
                 trajectory.finish_reason == "length" for trajectory in trajectories
             ) / len(trajectories),
             "policy_lag_max": max(self.learner_step - group.source_learner_step for group in groups),
+            # same weights score the same tokens, so this is ~0 unless the plumbing is off
+            "logprob_gap_mean": (proximal_logprobs[mask] - behavior).abs().mean().item(),
+            # mean NLL of sampled tokens: an entropy proxy
+            "sampled_nll": -behavior.mean().item(),
+            "response_len": mask.sum(1).float().mean().item(),
         })
         self.learner_step += 1
         return metrics
@@ -89,10 +99,10 @@ class SyncWorker:
         return rollout_groups
 
     @torch.no_grad()
-    def evaluate(self, inputs, max_samples_per_gen=512):
+    def evaluate(self, inputs, max_samples_per_gen=512, *, output_path=None):
         if not inputs:
             raise ValueError("Evaluation needs at least one prompt")
-        rewards, truncated = [], 0
+        rewards, truncated, parse_failures, samples = [], 0, 0, []
         for task, inp_prompt in inputs:
             prompt = {key: value.to(self.device) for key, value in inp_prompt.items()}
             output = self.model.generate(
@@ -103,19 +113,37 @@ class SyncWorker:
             )
             response_ids = output[0, prompt["input_ids"].shape[1]:].tolist()
             text = self.tokenizer.decode(response_ids, skip_special_tokens=True)
-            rewards.append(float(self.score_fn(task, text)))
-            truncated += not response_ids or response_ids[-1] not in self.eos_token_ids
-        return {
+            reward = float(self.score_fn(task, text))
+            rewards.append(reward)
+            hit_limit = not response_ids or response_ids[-1] not in self.eos_token_ids
+            truncated += hit_limit
+            parsed = self.answer_parser(text) if self.answer_parser is not None else None
+            parse_failures += parsed is None
+            if output_path is not None:
+                samples.append({
+                    "question_id": task.get("question_id"), "prompt": task.get("prompt"),
+                    "expected_answer": task.get("answer"), "response": text,
+                    "parsed_answer": str(parsed) if parsed is not None else None,
+                    "reward": reward, "finish_reason": "length" if hit_limit else "stop",
+                    "response_tokens": len(response_ids),
+                })
+        metrics = {
             "accuracy": sum(rewards) / len(rewards),
             "truncated_fraction": truncated / len(rewards),
             "num_examples": len(rewards),
             "policy_version": self.learner_step,
         }
+        if self.answer_parser is not None:
+            metrics["parse_failure_fraction"] = parse_failures / len(rewards)
+        if output_path is not None:
+            Path(output_path).write_text(json.dumps({"metrics": metrics, "samples": samples}, indent=2))
+        return metrics
 
     def save_checkpoint(self, path):
         path = Path(path)
         path.mkdir(parents=True, exist_ok=False)
         self.model.save_pretrained(path)
+        self.tokenizer.save_pretrained(path)
         torch.save({
             "learner_step": self.learner_step,
             "optimizer": self.optimizer.state_dict(),

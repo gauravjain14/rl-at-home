@@ -5,6 +5,7 @@ import torch
 import asyncio
 import json
 import ray
+import shutil
 import time
 from pathlib import Path
 from datasets import load_dataset
@@ -16,9 +17,11 @@ from rollout import collect_rollout_groups
 from buffer import RolloutBuffer, BufferClosed
 from workers import RolloutWorker, LearnerWorker, SyncWorker
 from mimo_music.pipeline import compute_score
-from gsm8k import gsm8k_score_fn
+from gsm8k import gsm8k_score_fn, extract_answer
 
 model_name = "Qwen/Qwen2.5-0.5B-Instruct"
+validation_size = 128
+split_seed = 42
 
 # Each worker can load its own model; importing the driver does not load one.
 def load_model():
@@ -72,9 +75,16 @@ def prepare_tasks(batch_size=16, task_name="gsm8k", *, split="train", limit=None
     inputs = []
 
     if task_name == "gsm8k":
-        dataset = load_dataset("openai/gsm8k", "main", split=split)
-        if split == "train":
-            dataset = dataset.shuffle(seed=42)
+        source_split = "train" if split == "validation" else split
+        dataset = load_dataset("openai/gsm8k", "main", split=source_split)
+        dataset = dataset.add_column("question_id", list(range(len(dataset))))
+        if split in ("train", "validation"):
+            if len(dataset) <= validation_size:
+                raise ValueError("Validation set must leave at least one training question")
+            dataset = dataset.shuffle(seed=split_seed)
+            indices = (range(validation_size) if split == "validation"
+                       else range(validation_size, len(dataset)))
+            dataset = dataset.select(indices)
         # apply expected chat format on the dataset
         print(dataset[0])
         for index, row in enumerate(dataset):
@@ -83,6 +93,7 @@ def prepare_tasks(batch_size=16, task_name="gsm8k", *, split="train", limit=None
             # just maintains music-style task formating
             # I don't think this approach is scalable though
             task = {
+                "question_id": row["question_id"],
                 "prompt": [{
                     "role": "user",
                     "content": (
@@ -164,27 +175,82 @@ async def generate_rollouts(inputs,
 async def main(sync_worker,
                *,
                num_train_steps=100,
-               groups_per_batch=1,
+               groups_per_batch=16,
                run_epoch=0,
                task_name="gsm8k",
                max_samples_per_gen=512,
                eval_inputs=None,
                checkpoint_dir=None,
-               wandb_run=None):
-    if groups_per_batch < 1 or (
+               wandb_run=None,
+               checkpoint_every=100,
+               run_config=None):
+    if groups_per_batch < 1 or checkpoint_every < 1 or (
         num_train_steps is not None and num_train_steps < 1
     ):
-        raise ValueError("Step count and groups_per_batch must be positive")
+        raise ValueError("Step count, groups_per_batch and checkpoint_every must be positive")
 
-    before = None
-    if eval_inputs is not None:
-        before = await sync_worker.evaluate.remote(eval_inputs, max_samples_per_gen)
-        print({"eval_before": before})
+    config = dict(run_config or {})
+    config.update(task=task_name, groups_per_batch=groups_per_batch,
+                  max_samples_per_gen=max_samples_per_gen, num_train_steps=num_train_steps,
+                  checkpoint_every=checkpoint_every, step_unit="training_batches",
+                  validation_size=validation_size, split_seed=split_seed, run_epoch=run_epoch)
+    if checkpoint_dir is not None:
+        checkpoint_dir = Path(checkpoint_dir)
+        checkpoint_dir.mkdir(parents=True, exist_ok=False)
+        (checkpoint_dir / "run_config.json").write_text(json.dumps(config, indent=2))
+        if eval_inputs is not None:
+            (checkpoint_dir / "validation_ids.json").write_text(json.dumps(
+                [task["question_id"] for task, _ in eval_inputs], indent=2,
+            ))
+
+    async def evaluate(step):
+        if eval_inputs is None:
+            return None
+        output_path = (str(checkpoint_dir / f"eval-{step:06d}.json")
+                       if checkpoint_dir is not None else None)
+        scores = await sync_worker.evaluate.remote(
+            eval_inputs, max_samples_per_gen, output_path=output_path,
+        )
+        print({"learner_step": step, "eval": scores})
         if wandb_run is not None:
             wandb_run.log({
-                "learner_step": 0,
-                **{f"eval/{key}": value for key, value in before.items()},
+                "learner_step": step,
+                **{f"eval/{key}": value for key, value in scores.items()},
             })
+        return scores
+
+    saved_checkpoints = []
+    best_checkpoint, latest_checkpoint = None, None
+    best_accuracy = float("-inf")
+
+    async def checkpoint_and_evaluate(step):
+        nonlocal best_checkpoint, latest_checkpoint, best_accuracy
+        if checkpoint_dir is not None:
+            path = checkpoint_dir / f"step-{step:06d}"
+            await sync_worker.save_checkpoint.remote(str(path))
+            (path / "run_config.json").write_text(json.dumps(config, indent=2))
+            saved_checkpoints.append(path)
+            latest_checkpoint = path
+            print({"learner_step": step, "checkpoint": str(path)})
+        scores = await evaluate(step)
+        if checkpoint_dir is not None:
+            if scores is not None and scores["accuracy"] > best_accuracy:
+                best_accuracy = scores["accuracy"]
+                best_checkpoint = latest_checkpoint
+            keep = set(saved_checkpoints[-2:]) | {best_checkpoint}
+            for old_path in saved_checkpoints[:]:
+                if old_path not in keep:
+                    shutil.rmtree(old_path)
+                    saved_checkpoints.remove(old_path)
+            (checkpoint_dir / "checkpoints.json").write_text(json.dumps({
+                "latest": latest_checkpoint.name,
+                "best": best_checkpoint.name if best_checkpoint is not None else None,
+                "best_accuracy": best_accuracy if best_checkpoint is not None else None,
+            }, indent=2))
+        return scores
+
+    before = await evaluate(0)
+    last_eval, last_checkpoint_step = before, 0
 
     step = 0
     group_id = 0
@@ -210,21 +276,22 @@ async def main(sync_worker,
                 "learner_step": step,
                 **{f"train/{key}": value for key, value in metrics.items()},
             })
+        if step % checkpoint_every == 0:
+            last_eval = await checkpoint_and_evaluate(step)
+            last_checkpoint_step = step
         if num_train_steps is not None and step >= num_train_steps:
             break
 
+    if step > 0 and step != last_checkpoint_step:
+        last_eval = await checkpoint_and_evaluate(step)
     result = {"learner_step": step, "metrics": metrics}
     if eval_inputs is not None:
         result["eval_before"] = before
-        result["eval_after"] = await sync_worker.evaluate.remote(eval_inputs, max_samples_per_gen)
-        print({"eval_after": result["eval_after"]})
-        if wandb_run is not None:
-            wandb_run.log({
-                "learner_step": step,
-                **{f"eval/{key}": value for key, value in result["eval_after"].items()},
-            })
-    if checkpoint_dir is not None:
-        result["checkpoint_dir"] = await sync_worker.save_checkpoint.remote(str(checkpoint_dir))
+        result["eval_after"] = last_eval
+    if latest_checkpoint is not None:
+        result["checkpoint_dir"] = str(latest_checkpoint)
+    if best_checkpoint is not None:
+        result["best_checkpoint_dir"] = str(best_checkpoint)
     return result
 
 
@@ -299,9 +366,13 @@ if __name__ == "__main__":
         model = AutoModelForCausalLM.from_pretrained(
             model_name, dtype=torch.float32, attn_implementation="sdpa",
         )
+        # Single source for settings used by both the code and the logged config.
+        num_gens, learning_rate, groups_per_batch, checkpoint_every = 8, 1e-6, 16, 25
+        seed, max_samples_per_gen, num_train_steps = 42, 512, None
         sync_worker = SyncWorker.remote(
             model=model, device="cuda:0", pad_token_id=tokenizer.pad_token_id,
-            tokenizer=tokenizer, score_fn=gsm8k_score_fn
+            tokenizer=tokenizer, score_fn=gsm8k_score_fn, num_gens=num_gens,
+            answer_parser=extract_answer, lr=learning_rate, seed=seed,
         )
         del model  # Release the driver's CPU copy after submitting it to Ray.
         # learner_worker = LearnerWorker.remote(
@@ -312,25 +383,34 @@ if __name__ == "__main__":
         #     model_name=model_name, score_fn=gsm8k_score_fn, num_gens=4,
         # )
         eval_inputs = [
-            entry for batch in prepare_tasks(task_name="gsm8k", split="test", limit=8)
+            entry for batch in prepare_tasks(task_name="gsm8k", split="validation")
             for entry in batch
         ]
         checkpoint_dir = Path("checkpoints") / f"gsm8k-{time.time_ns()}"
+        run_config = {
+            "model": model_name, "task": "gsm8k", "num_gens": num_gens,
+            "groups_per_batch": groups_per_batch, "micro_batch_size": 1,
+            "learning_rate": learning_rate,
+            "dtype": "float32", "temperature": 1.0, "seed": seed,
+            "validation_size": validation_size, "split_seed": split_seed,
+            "max_samples_per_gen": max_samples_per_gen, "checkpoint_every": checkpoint_every,
+            "num_train_steps": num_train_steps, "step_unit": "training_batches",
+        }
         with wandb.init(
             entity="scratchpad",
             project="nanoRL",
-            config={"model": model_name, "task": "gsm8k"},
+            config=run_config,
         ) as run:
             run.define_metric("learner_step")
             run.define_metric("train/*", step_metric="learner_step")
             run.define_metric("eval/*", step_metric="learner_step")
             result = asyncio.run(main(
                 sync_worker=sync_worker,
-                num_train_steps=None,
+                num_train_steps=num_train_steps, groups_per_batch=groups_per_batch,
+                max_samples_per_gen=max_samples_per_gen,
                 task_name="gsm8k", eval_inputs=eval_inputs, checkpoint_dir=checkpoint_dir,
-                wandb_run=run,
+                wandb_run=run, checkpoint_every=checkpoint_every, run_config=run_config,
             ))
-        tokenizer.save_pretrained(checkpoint_dir)
         with (checkpoint_dir / "run_metrics.json").open("w") as output:
             json.dump(result, output, indent=2)
         print(result)
