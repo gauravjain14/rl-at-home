@@ -171,7 +171,9 @@ async def main(sync_worker,
                eval_inputs=None,
                checkpoint_dir=None,
                wandb_run=None):
-    if num_train_steps < 1 or groups_per_batch < 1:
+    if groups_per_batch < 1 or (
+        num_train_steps is not None and num_train_steps < 1
+    ):
         raise ValueError("Step count and groups_per_batch must be positive")
 
     before = None
@@ -208,7 +210,7 @@ async def main(sync_worker,
                 "learner_step": step,
                 **{f"train/{key}": value for key, value in metrics.items()},
             })
-        if step >= num_train_steps:
+        if num_train_steps is not None and step >= num_train_steps:
             break
 
     result = {"learner_step": step, "metrics": metrics}
@@ -324,7 +326,7 @@ if __name__ == "__main__":
             run.define_metric("eval/*", step_metric="learner_step")
             result = asyncio.run(main(
                 sync_worker=sync_worker,
-                num_train_steps=100,
+                num_train_steps=None,
                 task_name="gsm8k", eval_inputs=eval_inputs, checkpoint_dir=checkpoint_dir,
                 wandb_run=run,
             ))

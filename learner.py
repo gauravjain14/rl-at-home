@@ -18,6 +18,9 @@ def train_step(model, optimizer, batch, proximal_logprobs, micro_batch_size=1):
         batch["rewards"],
         batch["group_index"],
     )
+    # all-equal groups carry no signal; skipping keeps Adam momentum from moving weights
+    if not advantages.any():
+        return {"loss": 0.0, "grad_norm": 0.0}
     total_tokens = batch["loss_mask"][:, 1:].sum()
     total_loss = 0.0
 
@@ -44,6 +47,8 @@ def train_step(model, optimizer, batch, proximal_logprobs, micro_batch_size=1):
         error_if_nonfinite=True)
     optimizer.step()
 
+    # free the gradient memory here
+    optimizer.zero_grad()
     return {"loss": total_loss, "grad_norm": grad_norm.item()}
 
 def score_batch(model, batch):

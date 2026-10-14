@@ -53,6 +53,7 @@ class DriverTests(unittest.IsolatedAsyncioTestCase):
     async def test_sequential_batches_partial_empty_and_step_limit(self):
         for count, limit, batches in (
             (0, 10, []), (5, 10, [[0, 1], [2, 3], [4]]), (5, 2, [[0, 1], [2, 3]]),
+            (0, None, []), (5, None, [[0, 1], [2, 3], [4]]),
         ):
             with self.subTest(count=count, limit=limit):
                 result, events = await self.drive(

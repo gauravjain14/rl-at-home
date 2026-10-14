@@ -20,6 +20,7 @@ class SyncWorker:
         if not callable(score_fn):
             raise ValueError("score_fn must be callable")
 
+        torch.manual_seed(42)
         self.model = model.to(device=device, dtype=torch.float32).eval()
         self.device = device
         self.optimizer = torch.optim.AdamW(self.model.parameters(), lr=1e-6, weight_decay=0.0)
@@ -40,7 +41,14 @@ class SyncWorker:
         batch = {key: value.to(self.device) for key, value in batch.items()}
 
         with torch.no_grad():
-            proximal_logprobs = score_batch(self.model, batch)
+            proximal_rows = []
+            for i in range(batch["input_ids"].shape[0]):
+                micro_batch = {
+                    key: value[i:(i+1)]
+                    for key, value in batch.items()
+                }
+                proximal_rows.append(score_batch(self.model, micro_batch))
+            proximal_logprobs = torch.cat(proximal_rows, dim=0)
 
         metrics = train_step(
             model=self.model,
