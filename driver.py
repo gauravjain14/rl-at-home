@@ -256,7 +256,10 @@ async def main(sync_worker,
     group_id = 0
     metrics = {}
     for input_batch in prepare_tasks(batch_size=groups_per_batch, task_name=task_name):
-        groups = []
+        groups = await sync_worker.collect_group.remote(
+            
+        )
+
         for task, inp_prompt in input_batch:
             group = await sync_worker.collect_group.remote(
                 task=task,
