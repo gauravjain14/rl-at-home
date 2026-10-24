@@ -5,56 +5,74 @@ import torch
 
 from protocol import Trajectory, RolloutGroup
 
-
 @torch.no_grad()
-def generate_rollouts(input_prompt,
+def generate_rollouts(input_prompts,
                     behavior_policy,
                     num_gens=1,
                     max_samples_per_gen=8192,
-                    eos_token_ids=()):
+                    eos_token_ids=(),
+                    pad_token_id=0):
 
     behavior_policy.eval()
-    rollouts = []
-    for j in range(num_gens):
-        input_ids = input_prompt
-        past_key_values = None
-        response_ids, behavior_logprobs = [], []
-        finish_reason = "length"
-        for i in range(max_samples_per_gen):
-            output = behavior_policy(
-                input_ids=input_ids,
-                past_key_values=past_key_values,
-                use_cache=True,
-                return_dict=True,
-            )
-            # assuming output [B, S, Vocab]
-            logprobs = output.logits[:, -1, :].float().log_softmax(dim=-1)
-            next_token = torch.multinomial(logprobs.exp(), num_samples=1)
-            response_ids.append(next_token.item())
-            sampled_logprobs = logprobs.gather(dim=-1, index=next_token)
-            behavior_logprobs.append(sampled_logprobs.item())
-            if next_token.item() in eos_token_ids:
-                finish_reason = "stop"
-                break
+    device = input_prompts[0].device
+    rows, max_prompt_len = len(input_prompts) * num_gens, max(len(p) for p in input_prompts)
+    input_ids = torch.full((rows, max_prompt_len), pad_token_id, device=device)
+    attention_mask = torch.zeros((rows, max_prompt_len), dtype=torch.long, device=device)
+    for k, p in enumerate(input_prompts):
+        # attention mask for every prompt
+        num_pad_tokens = max_prompt_len - len(p)
+        input_ids[k * num_gens : (k+1) * num_gens, num_pad_tokens:] = p
+        attention_mask[k * num_gens : (k+1) * num_gens,num_pad_tokens:] = 1
+    position_ids = (attention_mask.cumsum(-1) - 1).clamp(min=0)
+    eos = torch.tensor(eos_token_ids, dtype=torch.long, device=device)
+    done = torch.zeros(rows, dtype=torch.bool, device=device)
+    lengths = torch.full((rows,), max_samples_per_gen, device=device)
+    tokens, token_logprobs = [], []
+    past_key_values = None
 
-            past_key_values = output.past_key_values
-            input_ids = next_token
-        
-        rollouts.append({
-            "response_ids": response_ids,
-            "behavior_logprobs": behavior_logprobs,
-            "finish_reason": finish_reason
-        })
+    for i in range(max_samples_per_gen):
+        outputs = behavior_policy(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            position_ids=position_ids,
+            past_key_values=past_key_values,
+            use_cache=True,
+            return_dict=True,
+            logits_to_keep=1, # prevent the mem blowup hello.
+        )
+        # assuming output [B, S, Vocab]
+        logprobs = outputs.logits[:, -1, :].float().log_softmax(dim=-1)
+        next_token = torch.multinomial(logprobs.exp(), num_samples=1)
+        tokens.append(next_token.squeeze(-1))
+        token_logprobs.append(logprobs.gather(dim=-1, index=next_token).squeeze(-1))
+        is_eos = ~done & torch.isin(next_token.squeeze(-1), eos)
+        lengths = torch.where(is_eos, i + 1, lengths)
+        done |= is_eos
+        # this just checks for completion every 16 iterations. There should
+        # be a better way tbh.
+        if i % 16 == 15 and done.all():
+            break
+        past_key_values = outputs.past_key_values
+        input_ids = next_token
+        attention_mask = torch.cat([attention_mask,
+                                attention_mask.new_ones(rows, 1)], dim=1)
+        position_ids = position_ids[:, -1:] + 1
 
-    return rollouts
-
+    tokens = torch.stack(tokens, dim=1).tolist()
+    token_logprobs = torch.stack(token_logprobs, dim=1).tolist()
+    finished = done.tolist()
+    return [{
+        "response_ids": tokens[j][:n],
+        "behavior_logprobs": token_logprobs[j][:n],
+        "finish_reason": "stop" if finished[j] else "length",
+    } for j, n in enumerate(lengths.tolist())]
 
 def collect_rollout_groups(
-        task, input_prompt, behavior_policy,
+        tasks, input_prompts, behavior_policy,
         tokenizer, score_fn,
         *, group_id, run_epoch, source_learner_step,
         attempt_id=0, num_gens=4, max_samples_per_gen=128,
-        eos_token_ids=(),
+        eos_token_ids=(), pad_token_id=0
 ) -> RolloutGroup:
     """Generate and score responses to one unpadded prompt shaped [1, P].
 
@@ -62,45 +80,51 @@ def collect_rollout_groups(
     source_learner_step identifies the generator's loaded weights; the caller
     must keep those weights unchanged throughout this call.
     """
-    if input_prompt.ndim != 2 or input_prompt.shape[0] != 1 or input_prompt.shape[1] == 0:
-        raise ValueError("Expected one nonempty prompt with shape [1, P]")
+    if len(tasks) == 0 or len(tasks) != len(input_prompts):
+        raise ValueError("Expected one prompt per task")
     if num_gens < 1 or max_samples_per_gen < 1:
         raise ValueError("Generation count and response token limit must be positive")
 
     created_at = time.time()
-    prompt_ids = input_prompt[0].tolist()
+    prompts = [inp_prompt[0] for inp_prompt in input_prompts]
     rollouts = generate_rollouts(
-        input_prompt,
+        prompts,
         behavior_policy,
         num_gens=num_gens,
         max_samples_per_gen=max_samples_per_gen,
         eos_token_ids=eos_token_ids,
+        pad_token_id=pad_token_id
     )
 
-    trajectories = []
-    for rollout in rollouts:
-        response_ids = rollout["response_ids"]
-        response_text = tokenizer.decode(response_ids, skip_special_tokens=True)
-        reward = float(score_fn(task, response_text))
-        if not math.isfinite(reward):
-            raise ValueError("Scorer returned a non-finite reward")
-        trajectories.append(Trajectory(
-            prompt_ids=prompt_ids,
-            response_ids=response_ids,
-            behavior_logprobs=rollout["behavior_logprobs"],
-            loss_mask=[True] * len(response_ids),
-            reward=reward,
-            finish_reason=rollout["finish_reason"],
+    groups = []
+    for k, (task, prompt) in enumerate(zip(tasks, prompts)):
+        prompt_ids = prompt.tolist()
+        trajectories = []
+        for rollout in rollouts[k * num_gens:(k + 1) * num_gens]:
+            response_ids = rollout["response_ids"]
+            response_text = tokenizer.decode(response_ids, skip_special_tokens=True)
+            reward = float(score_fn(task, response_text))
+            if not math.isfinite(reward):
+                raise ValueError("Scorer returned a non-finite reward")
+            trajectories.append(Trajectory(
+                prompt_ids=prompt_ids,
+                response_ids=response_ids,
+                behavior_logprobs=rollout["behavior_logprobs"],
+                loss_mask=[True] * len(response_ids),
+                reward=reward,
+                finish_reason=rollout["finish_reason"],
+            ))
+
+        groups.append(RolloutGroup(
+            group_id=group_id + k,
+            attempt_id=attempt_id,
+            run_epoch=run_epoch,
+            source_learner_step=source_learner_step,
+            created_at=created_at,
+            trajectories=trajectories,
         ))
 
-    return RolloutGroup(
-        group_id=group_id,
-        attempt_id=attempt_id,
-        run_epoch=run_epoch,
-        source_learner_step=source_learner_step,
-        created_at=created_at,
-        trajectories=trajectories,
-    )
+    return groups
 
 
 # test generate_rollouts

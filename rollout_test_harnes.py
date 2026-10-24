@@ -10,23 +10,25 @@ from workers import SyncWorker
 
 def collect(worker, input_batch, first_group_id, max_new_tokens, batched):
     if batched:
-        return ray.get(worker.collect_groups.remote(
+        return ray.get(worker.collect_group.remote(
             tasks=[task for task, _ in input_batch],
             input_prompts=[inp_prompt["input_ids"] for _, inp_prompt in input_batch],
-            first_group_id=first_group_id,
+            group_id=first_group_id,
             run_epoch=0,
             max_samples_per_gen=max_new_tokens,
         ))
     # call it per prompt/task instead of in a batch
     return [ray.get(worker.collect_group.remote(
-        task=task, input_prompt=inp_prompt["input_ids"], group_id=first_group_id + i,
+        tasks=[task], input_prompts=[inp_prompt["input_ids"]], group_id=first_group_id + i,
         run_epoch=0, max_samples_per_gen=max_new_tokens,
-    )) for i, (task, inp_prompt) in enumerate(input_batch)]
+    ))[0] for i, (task, inp_prompt) in enumerate(input_batch)]
 
+def collect_batched():
+    pass
 
 def main():
     p = argparse.ArgumentParser()
-    p.add_argument("--groups", type=int, default=16)
+    p.add_argument("--groups", type=int, default=2)
     p.add_argument("--num-gens", type=int, default=8)
     p.add_argument("--max-new-tokens", type=int, default=512)
     p.add_argument("--batches", type=int, default=1)
