@@ -14,7 +14,8 @@ def generate_rollouts(input_prompts,
                     num_gens=1,
                     max_samples_per_gen=8192,
                     eos_token_ids=(),
-                    pad_token_id=0):
+                    pad_token_id=0,
+                    greedy=False):
 
     behavior_policy.eval()
     device = input_prompts[0].device
@@ -51,10 +52,10 @@ def generate_rollouts(input_prompts,
             debug_logprobs = outputs.logits.float().log_softmax(dim=-1)
             debugging_logp.append(debug_logprobs.cpu())
         logprobs = outputs.logits[:, -1, :].float().log_softmax(dim=-1)
-        # TODO: sampling shouldn't be hardcoded this way
-        next_token = torch.multinomial(logprobs.exp(), num_samples=1)
-        # enable greedy for debug
-        # next_token = logprobs.argmax(dim=-1, keepdim=True)
+        if greedy:
+            next_token = logprobs.argmax(dim=-1, keepdim=True)
+        else:
+            next_token = torch.multinomial(logprobs.exp(), num_samples=1)
         tokens.append(next_token.squeeze(-1))
         token_logprobs.append(logprobs.gather(dim=-1, index=next_token).squeeze(-1))
         is_eos = ~done & torch.isin(next_token.squeeze(-1), eos)

@@ -6,7 +6,7 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 
 from rollout import collect_rollout_groups, generate_rollouts
 from batching import collate_groups
-from learner import train_step, score_batch
+from learner import train_step, score_proximal
 
 
 @ray.remote(num_cpus=1, num_gpus=1)
@@ -18,7 +18,7 @@ class SyncWorker:
     # also runs the evals
     def __init__(self, model, device, pad_token_id, learner_step=0,
                  *, tokenizer, score_fn, num_gens=8, answer_parser=None, lr=1e-6,
-                 seed=42):
+                 seed=42, micro_batch_size=1, ppo_epochs=1, num_minibatches=1):
         if not callable(score_fn):
             raise ValueError("score_fn must be callable")
 
@@ -32,6 +32,9 @@ class SyncWorker:
         self.score_fn = score_fn
         self.answer_parser = answer_parser
         self.num_gens = num_gens
+        self.micro_batch_size = micro_batch_size
+        self.ppo_epochs = ppo_epochs
+        self.num_minibatches = num_minibatches
 
         eos = self.model.generation_config.eos_token_id
         if eos is None:
@@ -43,21 +46,16 @@ class SyncWorker:
         batch = collate_groups(groups, pad_token_id=self.pad_token_id)
         batch = {key: value.to(self.device) for key, value in batch.items()}
 
-        with torch.no_grad():
-            proximal_rows = []
-            for i in range(batch["input_ids"].shape[0]):
-                micro_batch = {
-                    key: value[i:(i+1)]
-                    for key, value in batch.items()
-                }
-                proximal_rows.append(score_batch(self.model, micro_batch))
-            proximal_logprobs = torch.cat(proximal_rows, dim=0)
+        proximal_logprobs = score_proximal(self.model, batch, self.micro_batch_size)
 
         metrics = train_step(
             model=self.model,
             optimizer=self.optimizer,
             batch=batch,
-            proximal_logprobs=proximal_logprobs
+            proximal_logprobs=proximal_logprobs,
+            micro_batch_size=self.micro_batch_size,
+            ppo_epochs=self.ppo_epochs,
+            num_minibatches=self.num_minibatches,
         )
         trajectories = [trajectory for group in groups for trajectory in group.trajectories]
         mask = batch["loss_mask"][:, 1:]
@@ -235,26 +233,32 @@ class RolloutWorker:
 
 @ray.remote(num_cpus=1, num_gpus=1)
 class LearnerWorker:
-    def __init__(self, model, device, pad_token_id, learner_step=0):
+    def __init__(self, model, device, pad_token_id, learner_step=0,
+                 *, micro_batch_size=1, ppo_epochs=1, num_minibatches=1):
         self.model = model.to(device=device, dtype=torch.float32).eval()
         self.device = device
         self.optimizer = torch.optim.AdamW(self.model.parameters(), lr=1e-6, weight_decay=0.0)
         self.pad_token_id = pad_token_id
         self.learner_step = learner_step
- 
+        self.micro_batch_size = micro_batch_size
+        self.ppo_epochs = ppo_epochs
+        self.num_minibatches = num_minibatches
+
     def train_groups(self, groups):
         batch = collate_groups(groups, pad_token_id=self.pad_token_id)
         batch = {key: value.to(self.device) for key, value in batch.items()}
-        
+
         # proximal policy my friends.
-        with torch.no_grad():
-            proximal_logprobs = score_batch(self.model, batch)
+        proximal_logprobs = score_proximal(self.model, batch, self.micro_batch_size)
 
         metrics = train_step(
             model=self.model,
             optimizer=self.optimizer,
             batch=batch,
-            proximal_logprobs=proximal_logprobs
+            proximal_logprobs=proximal_logprobs,
+            micro_batch_size=self.micro_batch_size,
+            ppo_epochs=self.ppo_epochs,
+            num_minibatches=self.num_minibatches,
         )
 
         trajectories = [trajectory for group in groups 

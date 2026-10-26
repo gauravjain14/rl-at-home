@@ -2,12 +2,12 @@
 
 from types import SimpleNamespace
 import unittest
-from unittest.mock import Mock
+from unittest.mock import Mock, patch
 
 import torch
 import torch.nn.functional as F
 
-from learner import score_batch, train_step
+from learner import score_batch, score_proximal, train_step
 
 
 class ScoreBatchTests(unittest.TestCase):
@@ -118,6 +118,58 @@ class TrainStepTests(unittest.TestCase):
             torch.testing.assert_close(grad, expected_grad)
             self.assertAlmostEqual(metrics["loss"], expected_metrics["loss"], places=6)
             self.assertAlmostEqual(metrics["grad_norm"], expected_metrics["grad_norm"], places=5)
+
+
+class PPOStepTests(unittest.TestCase):
+    def setUp(self):
+        rows = {
+            "input_ids": torch.tensor([[1, 2, 3, 4], [1, 2, 5, 0]]),
+            "attention_mask": torch.tensor([[True, True, True, True], [True, True, True, False]]),
+            "loss_mask": torch.tensor([[False, False, True, True], [False, False, True, False]]),
+        }
+        # two groups of two rows, each with a reward spread
+        self.batch = {key: value[[0, 1, 0, 1]] for key, value in rows.items()}
+        self.batch["rewards"] = torch.tensor([1., 0., 0., 1.])
+        self.batch["group_index"] = torch.tensor([0, 0, 1, 1])
+        with torch.no_grad():
+            self.proximal = score_batch(TinyPolicy(), self.batch)
+        self.batch["behavior_logprobs"] = torch.cat([torch.zeros(4, 1), self.proximal.clone()], dim=1)
+
+    def test_minibatches_step_once_each_against_the_frozen_proximal(self):
+        model = TinyPolicy()
+        optimizer = torch.optim.SGD(model.parameters(), lr=.1)
+        steps = []
+        optimizer.register_step_post_hook(lambda *args: steps.append(1))
+        with patch("learner.torch.randperm", side_effect=torch.arange):
+            metrics = train_step(model, optimizer, self.batch, self.proximal, ppo_epochs=2, num_minibatches=2)
+        self.assertEqual(len(steps), 4)
+        # reference: the same four steps, one whole group each. A group's advantages do not
+        # depend on the rest of the batch, so train_step on that group alone is the same step.
+        reference = TinyPolicy()
+        ref_optimizer = torch.optim.SGD(reference.parameters(), lr=.1)
+        ref_metrics = []
+        for _ in range(2):
+            for rows in ([0, 1], [2, 3]):
+                part = {key: value[rows] for key, value in self.batch.items()}
+                ref_metrics.append(train_step(reference, ref_optimizer, part, self.proximal[rows]))
+        torch.testing.assert_close(model.logits, reference.logits)
+        self.assertAlmostEqual(metrics["loss"], sum(m["loss"] for m in ref_metrics) / 4, places=6)
+        self.assertAlmostEqual(metrics["grad_norm"], sum(m["grad_norm"] for m in ref_metrics) / 4, places=5)
+
+    def test_score_proximal_matches_one_full_batch_pass(self):
+        model = TinyPolicy()
+        with torch.no_grad():
+            model.logits.normal_()
+            full = score_batch(model, self.batch)
+        for size in (1, 3, 4):
+            proximal = score_proximal(model, self.batch, size)
+            self.assertFalse(proximal.requires_grad)
+            torch.testing.assert_close(proximal, full)
+
+    def test_invalid_update_settings(self):
+        for kwargs in ({"ppo_epochs": 0}, {"num_minibatches": 0}):
+            with self.subTest(**kwargs), self.assertRaises(ValueError):
+                train_step(TinyPolicy(), Mock(), self.batch, self.proximal, **kwargs)
 
 
 if __name__ == "__main__":
