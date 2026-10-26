@@ -258,7 +258,8 @@ class LearnerWorker:
             proximal_logprobs=proximal_logprobs
         )
 
-        trajectories = [trajectory for group in groups for trajectory in group.trajectories]
+        trajectories = [trajectory for group in groups 
+                        for trajectory in group.trajectories]
         metrics.update({
             "reward_mean": batch["rewards"].mean().item(),
             "equal_reward_group_fraction": sum(

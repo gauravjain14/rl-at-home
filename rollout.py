@@ -15,8 +15,10 @@ def generate_rollouts(input_prompts,
 
     behavior_policy.eval()
     device = input_prompts[0].device
-    rows, max_prompt_len = len(input_prompts) * num_gens, max(len(p) for p in input_prompts)
+    rows = len(input_prompts) * num_gens
+    max_prompt_len = max(len(p) for p in input_prompts)
     input_ids = torch.full((rows, max_prompt_len), pad_token_id, device=device)
+    print(input_ids.shape)
     attention_mask = torch.zeros((rows, max_prompt_len), dtype=torch.long, device=device)
     for k, p in enumerate(input_prompts):
         # attention mask for every prompt
@@ -29,6 +31,7 @@ def generate_rollouts(input_prompts,
     lengths = torch.full((rows,), max_samples_per_gen, device=device)
     tokens, token_logprobs = [], []
     past_key_values = None
+    debugging_logp = []
 
     for i in range(max_samples_per_gen):
         outputs = behavior_policy(
@@ -41,8 +44,13 @@ def generate_rollouts(input_prompts,
             logits_to_keep=1, # prevent the mem blowup hello.
         )
         # assuming output [B, S, Vocab]
+        debug_logprobs = outputs.logits.float().log_softmax(dim=-1)
+        debugging_logp.append(debug_logprobs.cpu())
         logprobs = outputs.logits[:, -1, :].float().log_softmax(dim=-1)
-        next_token = torch.multinomial(logprobs.exp(), num_samples=1)
+        # TODO: sampling shouldn't be hardcoded this way
+        # next_token = torch.multinomial(logprobs.exp(), num_samples=1)
+        # enable greedy for debug
+        next_token = logprobs.argmax(dim=-1, keepdim=True)
         tokens.append(next_token.squeeze(-1))
         token_logprobs.append(logprobs.gather(dim=-1, index=next_token).squeeze(-1))
         is_eos = ~done & torch.isin(next_token.squeeze(-1), eos)
@@ -62,6 +70,7 @@ def generate_rollouts(input_prompts,
     token_logprobs = torch.stack(token_logprobs, dim=1).tolist()
     finished = done.tolist()
     return [{
+        "debug_logp": [step[j].clone() for step in debugging_logp],
         "response_ids": tokens[j][:n],
         "behavior_logprobs": token_logprobs[j][:n],
         "finish_reason": "stop" if finished[j] else "length",
@@ -86,6 +95,7 @@ def collect_rollout_groups(
         raise ValueError("Generation count and response token limit must be positive")
 
     created_at = time.time()
+    # not padded here
     prompts = [inp_prompt[0] for inp_prompt in input_prompts]
     rollouts = generate_rollouts(
         prompts,
@@ -113,6 +123,7 @@ def collect_rollout_groups(
                 loss_mask=[True] * len(response_ids),
                 reward=reward,
                 finish_reason=rollout["finish_reason"],
+                logp=rollout["debug_logp"],
             ))
 
         groups.append(RolloutGroup(
@@ -123,7 +134,6 @@ def collect_rollout_groups(
             created_at=created_at,
             trajectories=trajectories,
         ))
-
     return groups
 
 

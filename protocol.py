@@ -17,7 +17,7 @@ class RolloutGroup:
     
 class Trajectory:
     def __init__(self, prompt_ids, response_ids, behavior_logprobs,
-                 loss_mask, reward, finish_reason):
+                 loss_mask, reward, finish_reason, logp=None):
         self.prompt_ids = prompt_ids
         self.response_ids = response_ids
         # Generator logprobs of the sampled response tokens.
@@ -26,3 +26,4 @@ class Trajectory:
         self.loss_mask = loss_mask
         self.reward = reward
         self.finish_reason = finish_reason
+        self.debug_logp = logp

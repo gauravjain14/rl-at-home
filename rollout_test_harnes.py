@@ -64,6 +64,16 @@ def main():
             groups = collect(worker, input_batch, group_id,
                             args.max_new_tokens, args.batched)
             seconds = time.perf_counter() - start
+            debug_logp = {}
+            for g, (task, _) in zip(groups, input_batch):
+                debug_logp[g.group_id] = {
+                    "question_id": task["question_id"],
+                    "prompt_len": len(g.trajectories[0].prompt_ids),
+                    "response_ids": [traj.response_ids for traj in g.trajectories],
+                    "debug_logp": [traj.debug_logp for traj in g.trajectories],
+                }
+            mode = "batched" if args.batched else "unbatched"
+            torch.save(debug_logp, f"debug_logp_{mode}_batch{b}.pt")
             group_id += len(groups)
 
             trajectors = [t for g in groups for t in g.trajectories]
