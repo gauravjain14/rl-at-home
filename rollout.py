@@ -5,6 +5,9 @@ import torch
 
 from protocol import Trajectory, RolloutGroup
 
+# keep full-vocab log-probs of every step on each trajectory (~0.6 MB per row per step)
+DEBUG_LOGP = False
+
 @torch.no_grad()
 def generate_rollouts(input_prompts,
                     behavior_policy,
@@ -44,13 +47,14 @@ def generate_rollouts(input_prompts,
             logits_to_keep=1, # prevent the mem blowup hello.
         )
         # assuming output [B, S, Vocab]
-        debug_logprobs = outputs.logits.float().log_softmax(dim=-1)
-        debugging_logp.append(debug_logprobs.cpu())
+        if DEBUG_LOGP:
+            debug_logprobs = outputs.logits.float().log_softmax(dim=-1)
+            debugging_logp.append(debug_logprobs.cpu())
         logprobs = outputs.logits[:, -1, :].float().log_softmax(dim=-1)
         # TODO: sampling shouldn't be hardcoded this way
-        # next_token = torch.multinomial(logprobs.exp(), num_samples=1)
+        next_token = torch.multinomial(logprobs.exp(), num_samples=1)
         # enable greedy for debug
-        next_token = logprobs.argmax(dim=-1, keepdim=True)
+        # next_token = logprobs.argmax(dim=-1, keepdim=True)
         tokens.append(next_token.squeeze(-1))
         token_logprobs.append(logprobs.gather(dim=-1, index=next_token).squeeze(-1))
         is_eos = ~done & torch.isin(next_token.squeeze(-1), eos)

@@ -257,19 +257,13 @@ async def main(sync_worker,
     metrics = {}
     for input_batch in prepare_tasks(batch_size=groups_per_batch, task_name=task_name):
         groups = await sync_worker.collect_group.remote(
-            
+            tasks=[task for task, _ in input_batch],
+            input_prompts=[inp_prompt["input_ids"] for _, inp_prompt in input_batch],
+            group_id=group_id,
+            run_epoch=run_epoch,
+            max_samples_per_gen=max_samples_per_gen,
         )
-
-        for task, inp_prompt in input_batch:
-            group = await sync_worker.collect_group.remote(
-                task=task,
-                input_prompt=inp_prompt["input_ids"],
-                group_id=group_id,
-                run_epoch=run_epoch,
-                max_samples_per_gen=max_samples_per_gen,
-            )
-            groups.append(group)
-            group_id += 1
+        group_id += len(groups)
 
         metrics = await sync_worker.train_groups.remote(groups)
         step += 1
