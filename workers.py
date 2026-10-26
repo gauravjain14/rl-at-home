@@ -177,11 +177,12 @@ class RolloutWorker:
         self.eos_token_ids = (eos,) if isinstance(eos, int) else tuple(eos or ())
 
 
-    def collect_group(self, task, input_prompt, *, group_id, run_epoch,
+    def collect_group(self, tasks, input_prompts, *, group_id, run_epoch,
                       max_samples_per_gen=1024):
+        inputs = [input_prompt.to(self.device) for input_prompt in input_prompts]
         rollout_groups = collect_rollout_groups(
-            task=task,
-            input_prompt=input_prompt.to(self.device),
+            tasks=tasks,
+            input_prompts=inputs,
             behavior_policy=self.model,
             tokenizer=self.tokenizer,
             score_fn=self.score_fn,
@@ -191,9 +192,10 @@ class RolloutWorker:
             num_gens=self.num_gens,
             max_samples_per_gen=max_samples_per_gen,
             eos_token_ids=self.eos_token_ids,
+            pad_token_id=self.tokenizer.pad_token_id,
         )
         return rollout_groups
-    
+
     @torch.no_grad()
     def load_weights(self, snapshot):
         version = snapshot["learner_step"]

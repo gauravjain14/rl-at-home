@@ -1,0 +1,8 @@
+Repository: https://github.com/XiaomiMiMo/verl
+Revision: a2ad9f6160b03ff2d47e59832bfb6b289f37c917
+Branch at import: mimo-oss
+Source directory: recipes/design/music/scorer/
+Python source files copied unchanged; LICENSE copied from upstream root.
+Baseline JSON content unchanged; a final newline was added.
+Runtime dependency: abc2midi executable (Ubuntu package: abcmidi).
+Python dependencies: standard library only.

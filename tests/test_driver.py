@@ -7,6 +7,7 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock, patch
 
 import driver
+from buffer import RolloutBuffer
 from protocol import RolloutGroup
 
 
@@ -147,3 +148,18 @@ class DriverTests(unittest.IsolatedAsyncioTestCase):
                 worker.save_checkpoint.remote.assert_not_awaited()
                 if stage == "collect_group":
                     worker.train_groups.remote.assert_not_awaited()
+
+    async def test_async_producer_puts_one_group_per_prompt(self):
+        calls = []
+
+        async def collect(**args):
+            calls.append((args["tasks"], args["input_prompts"], args["group_id"], args["run_epoch"]))
+            return [RolloutGroup(args["group_id"], 0, args["run_epoch"], 0, 0, [])]
+
+        worker = SimpleNamespace(collect_group=SimpleNamespace(remote=collect))
+        buffer = RolloutBuffer(capacity=8, max_lag=0)
+        inputs = [[("a", {"input_ids": 1}), ("b", {"input_ids": 2})], [("c", {"input_ids": 3})]]
+        await driver.generate_rollouts(inputs, worker, buffer, run_epoch=4)
+        self.assertEqual(calls, [(["a"], [1], 0, 4), (["b"], [2], 1, 4), (["c"], [3], 2, 4)])
+        self.assertEqual([group.group_id for group in buffer.buffer], [0, 1, 2])
+        self.assertTrue(buffer.closed)

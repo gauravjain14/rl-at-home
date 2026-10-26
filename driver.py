@@ -76,14 +76,14 @@ async def generate_rollouts(inputs,
                 # That worker supplies its actual loaded source_learner_step.
                 # probably this might be a common entry point for other rollouts?
                 rollout_groups = await rollout_worker.collect_group.remote(
-                    task=task,
-                    input_prompt=inp_prompt["input_ids"],
+                    tasks=[task],
+                    input_prompts=[inp_prompt["input_ids"]],
                     group_id=group_id,
                     run_epoch=run_epoch,
                     max_samples_per_gen=max_samples_per_gen
                 )
 
-                await rollout_buffer.put(rollout_groups)
+                await rollout_buffer.put(rollout_groups[0])
                 group_id += 1
     finally:
         await rollout_buffer.close()
@@ -285,12 +285,15 @@ if __name__ == "__main__":
         # Single source for settings used by both the code and the logged config.
         num_gens, learning_rate, groups_per_batch, checkpoint_every = 8, 1e-6, 16, 25
         seed, max_samples_per_gen, num_train_steps = 42, 512, None
+        micro_batch_size, ppo_epochs, num_minibatches = 1, 1, 1
         task_name = "gsm8k"
         task = get_task(task_name)
         sync_worker = SyncWorker.remote(
             model=model, device="cuda:0", pad_token_id=tokenizer.pad_token_id,
             tokenizer=tokenizer, score_fn=task.score, num_gens=num_gens,
             answer_parser=task.parse, lr=learning_rate, seed=seed,
+            micro_batch_size=micro_batch_size, ppo_epochs=ppo_epochs,
+            num_minibatches=num_minibatches,
         )
         del model  # Release the driver's CPU copy after submitting it to Ray.
         # learner_worker = LearnerWorker.remote(
@@ -307,7 +310,8 @@ if __name__ == "__main__":
         checkpoint_dir = Path("checkpoints") / f"{task_name}-{time.time_ns()}"
         run_config = {
             "model": model_name, "task": task_name, "num_gens": num_gens,
-            "groups_per_batch": groups_per_batch, "micro_batch_size": 1,
+            "groups_per_batch": groups_per_batch, "micro_batch_size": micro_batch_size,
+            "ppo_epochs": ppo_epochs, "num_minibatches": num_minibatches,
             "learning_rate": learning_rate,
             "dtype": "float32", "temperature": 1.0, "seed": seed,
             "validation_size": getattr(task, "validation_size", None),
