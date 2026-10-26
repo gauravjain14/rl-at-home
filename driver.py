@@ -8,7 +8,6 @@ import ray
 import shutil
 import time
 from pathlib import Path
-from datasets import load_dataset
 from transformers import AutoTokenizer, AutoModelForCausalLM
 
 from learner import score_batch
@@ -16,12 +15,9 @@ from batching import collate_groups
 from rollout import collect_rollout_groups
 from buffer import RolloutBuffer, BufferClosed
 from workers import RolloutWorker, LearnerWorker, SyncWorker
-from mimo_music.pipeline import compute_score
-from gsm8k import gsm8k_score_fn, extract_answer
+from tasks import get_task
 
 model_name = "Qwen/Qwen2.5-0.5B-Instruct"
-validation_size = 128
-split_seed = 42
 
 # Each worker can load its own model; importing the driver does not load one.
 def load_model():
@@ -65,84 +61,6 @@ async def learner_step(inp_buffer, learner_worker, rollout_worker,
     return {"learner_step": step, "metrics": metrics}
 
 
-mimo_score_fn = None
-
-# Task data stays on CPU until the rollout worker consumes it.
-def prepare_tasks(batch_size=16, task_name="gsm8k", *, split="train", limit=None):
-    if batch_size < 1 or (limit is not None and limit < 0):
-        raise ValueError("Invalid task batch size or limit")
-    tokenizer = AutoTokenizer.from_pretrained(model_name)
-    inputs = []
-
-    if task_name == "gsm8k":
-        source_split = "train" if split == "validation" else split
-        dataset = load_dataset("openai/gsm8k", "main", split=source_split)
-        dataset = dataset.add_column("question_id", list(range(len(dataset))))
-        if split in ("train", "validation"):
-            if len(dataset) <= validation_size:
-                raise ValueError("Validation set must leave at least one training question")
-            dataset = dataset.shuffle(seed=split_seed)
-            indices = (range(validation_size) if split == "validation"
-                       else range(validation_size, len(dataset)))
-            dataset = dataset.select(indices)
-        # apply expected chat format on the dataset
-        print(dataset[0])
-        for index, row in enumerate(dataset):
-            if limit is not None and index >= limit:
-                break
-            # just maintains music-style task formating
-            # I don't think this approach is scalable though
-            task = {
-                "question_id": row["question_id"],
-                "prompt": [{
-                    "role": "user",
-                    "content": (
-                        row["question"] 
-                        + "\nSolve step by step. On the last line, write #### followed by your numerical answer."
-                    )
-                }],
-                "answer": row["answer"].rsplit("####", 1)[-1].strip(),
-            }
-            inp_prompt = tokenizer.apply_chat_template(
-                task["prompt"],
-                tokenize=True,
-                add_generation_prompt=True,
-                return_tensors="pt",
-                return_dict=True,
-            )
-            inputs.append((task, inp_prompt))
-            if len(inputs) == batch_size:
-                yield inputs
-                inputs = []
-    elif task_name == "music":
-        music_tasks = load_dataset(
-            "XiaomiMiMo/MiMo-V2.6-RL-oss",
-            name="music",
-            split=split,
-        )
-
-        for index, task in enumerate(music_tasks):
-            if limit is not None and index >= limit:
-                break
-            inp_prompt = tokenizer.apply_chat_template(
-                task["prompt"],
-                tokenize=True,
-                add_generation_prompt=True,
-                return_tensors="pt",
-                return_dict=True,
-            )  # The rollout worker moves input_ids onto its own GPU.
-
-            inputs.append((task, inp_prompt))
-
-            if len(inputs) == batch_size:
-                yield inputs
-                inputs = []
-    else:
-        raise ValueError(f"Unknown task: {task_name}")
-
-    if inputs:
-        yield inputs
-
 # generation pipeline that keeps running separate from the trainer
 async def generate_rollouts(inputs,
                             rollout_worker,
@@ -174,6 +92,7 @@ async def generate_rollouts(inputs,
 # sync workers
 async def main(sync_worker,
                *,
+               train_batches,
                num_train_steps=100,
                groups_per_batch=16,
                run_epoch=0,
@@ -193,7 +112,7 @@ async def main(sync_worker,
     config.update(task=task_name, groups_per_batch=groups_per_batch,
                   max_samples_per_gen=max_samples_per_gen, num_train_steps=num_train_steps,
                   checkpoint_every=checkpoint_every, step_unit="training_batches",
-                  validation_size=validation_size, split_seed=split_seed, run_epoch=run_epoch)
+                  run_epoch=run_epoch)
     if checkpoint_dir is not None:
         checkpoint_dir = Path(checkpoint_dir)
         checkpoint_dir.mkdir(parents=True, exist_ok=False)
@@ -255,7 +174,7 @@ async def main(sync_worker,
     step = 0
     group_id = 0
     metrics = {}
-    for input_batch in prepare_tasks(batch_size=groups_per_batch, task_name=task_name):
+    for input_batch in train_batches:
         groups = await sync_worker.collect_group.remote(
             tasks=[task for task, _ in input_batch],
             input_prompts=[inp_prompt["input_ids"] for _, inp_prompt in input_batch],
@@ -366,10 +285,12 @@ if __name__ == "__main__":
         # Single source for settings used by both the code and the logged config.
         num_gens, learning_rate, groups_per_batch, checkpoint_every = 8, 1e-6, 16, 25
         seed, max_samples_per_gen, num_train_steps = 42, 512, None
+        task_name = "gsm8k"
+        task = get_task(task_name)
         sync_worker = SyncWorker.remote(
             model=model, device="cuda:0", pad_token_id=tokenizer.pad_token_id,
-            tokenizer=tokenizer, score_fn=gsm8k_score_fn, num_gens=num_gens,
-            answer_parser=extract_answer, lr=learning_rate, seed=seed,
+            tokenizer=tokenizer, score_fn=task.score, num_gens=num_gens,
+            answer_parser=task.parse, lr=learning_rate, seed=seed,
         )
         del model  # Release the driver's CPU copy after submitting it to Ray.
         # learner_worker = LearnerWorker.remote(
@@ -380,16 +301,17 @@ if __name__ == "__main__":
         #     model_name=model_name, score_fn=gsm8k_score_fn, num_gens=4,
         # )
         eval_inputs = [
-            entry for batch in prepare_tasks(task_name="gsm8k", split="validation")
+            entry for batch in task.batches(tokenizer, split="validation")
             for entry in batch
         ]
-        checkpoint_dir = Path("checkpoints") / f"gsm8k-{time.time_ns()}"
+        checkpoint_dir = Path("checkpoints") / f"{task_name}-{time.time_ns()}"
         run_config = {
-            "model": model_name, "task": "gsm8k", "num_gens": num_gens,
+            "model": model_name, "task": task_name, "num_gens": num_gens,
             "groups_per_batch": groups_per_batch, "micro_batch_size": 1,
             "learning_rate": learning_rate,
             "dtype": "float32", "temperature": 1.0, "seed": seed,
-            "validation_size": validation_size, "split_seed": split_seed,
+            "validation_size": getattr(task, "validation_size", None),
+            "split_seed": getattr(task, "split_seed", None),
             "max_samples_per_gen": max_samples_per_gen, "checkpoint_every": checkpoint_every,
             "num_train_steps": num_train_steps, "step_unit": "training_batches",
         }
@@ -403,9 +325,10 @@ if __name__ == "__main__":
             run.define_metric("eval/*", step_metric="learner_step")
             result = asyncio.run(main(
                 sync_worker=sync_worker,
+                train_batches=task.batches(tokenizer, batch_size=groups_per_batch),
                 num_train_steps=num_train_steps, groups_per_batch=groups_per_batch,
                 max_samples_per_gen=max_samples_per_gen,
-                task_name="gsm8k", eval_inputs=eval_inputs, checkpoint_dir=checkpoint_dir,
+                task_name=task_name, eval_inputs=eval_inputs, checkpoint_dir=checkpoint_dir,
                 wandb_run=run, checkpoint_every=checkpoint_every, run_config=run_config,
             ))
         with (checkpoint_dir / "run_metrics.json").open("w") as output:

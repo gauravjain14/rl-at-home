@@ -4,8 +4,8 @@ import ray
 import torch
 
 from transformers import AutoModelForCausalLM, AutoTokenizer
-from driver import model_name, prepare_tasks
-from gsm8k import gsm8k_score_fn, extract_answer
+from driver import model_name
+from tasks import gsm8k
 from workers import SyncWorker
 from rollout import DEBUG_LOGP
 
@@ -49,15 +49,15 @@ def main():
             device="cuda:0",
             pad_token_id=tokenizer.pad_token_id,
             tokenizer=tokenizer,
-            score_fn=gsm8k_score_fn,
+            score_fn=gsm8k.score,
             num_gens=args.num_gens,
-            answer_parser=extract_answer,
+            answer_parser=gsm8k.parse,
             lr=1e-6,
             seed=42,
         )
         del model
 
-        batches = prepare_tasks(batch_size=args.groups, task_name="gsm8k")
+        batches = gsm8k.batches(tokenizer, batch_size=args.groups)
         group_id = 0
         for b in range(args.batches):
             input_batch = next(batches)

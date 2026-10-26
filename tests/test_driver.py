@@ -58,10 +58,8 @@ class DriverTests(unittest.IsolatedAsyncioTestCase):
         size = kwargs.get("groups_per_batch", 16)
         prepared = [(i, {"input_ids": [[i]]}) for i in range(count)]
         inputs = [prepared[i:i + size] for i in range(0, count, size)]
-        with patch.object(driver, "prepare_tasks", return_value=iter(inputs)) as prepare, \
-                patch("builtins.print"):
-            result = await asyncio.wait_for(driver.main(worker, **kwargs), 2)
-        prepare.assert_called_once_with(batch_size=size, task_name="gsm8k")
+        with patch("builtins.print"):
+            result = await asyncio.wait_for(driver.main(worker, train_batches=iter(inputs), **kwargs), 2)
         return result, events
 
     async def test_sequential_batches_partial_empty_and_step_limit(self):
@@ -144,9 +142,8 @@ class DriverTests(unittest.IsolatedAsyncioTestCase):
                     for name in ("collect_group", "train_groups", "save_checkpoint")
                 })
                 getattr(worker, stage).remote.side_effect = RuntimeError(stage)
-                with patch.object(driver, "prepare_tasks", return_value=[[({}, {"input_ids": None})]]):
-                    with self.assertRaisesRegex(RuntimeError, stage):
-                        await driver.main(worker)
+                with self.assertRaisesRegex(RuntimeError, stage):
+                    await driver.main(worker, train_batches=[[({}, {"input_ids": None})]])
                 worker.save_checkpoint.remote.assert_not_awaited()
                 if stage == "collect_group":
                     worker.train_groups.remote.assert_not_awaited()
