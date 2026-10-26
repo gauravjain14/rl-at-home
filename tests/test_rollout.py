@@ -120,12 +120,10 @@ class BatchingTests(unittest.TestCase):
             num_attention_heads=4, num_key_value_heads=2, max_position_embeddings=64,
         )).eval()
         prompts = [torch.tensor([5, 9, 3, 11, 2]), torch.tensor([7, 1, 4])]  # the second gets left-padded
-        greedy = lambda probs, num_samples: probs.argmax(-1, keepdim=True)  # noqa: E731
-        with patch("rollout.torch.multinomial", side_effect=greedy):
-            batched = generate_rollouts(prompts, model, num_gens=2, max_samples_per_gen=12,
-                                        eos_token_ids=(), pad_token_id=0)
-            alone = [generate_rollouts([p], model, num_gens=1, max_samples_per_gen=12,
-                                       eos_token_ids=(), pad_token_id=0)[0] for p in prompts]
+        batched = generate_rollouts(prompts, model, num_gens=2, max_samples_per_gen=12,
+                                    eos_token_ids=(), pad_token_id=0, greedy=True)
+        alone = [generate_rollouts([p], model, num_gens=1, max_samples_per_gen=12,
+                                   eos_token_ids=(), pad_token_id=0, greedy=True)[0] for p in prompts]
         for k, ref in enumerate(alone):
             for row in batched[2 * k:2 * k + 2]:
                 self.assertEqual(row["response_ids"], ref["response_ids"])

@@ -4,7 +4,7 @@ import ray
 from pathlib import Path
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
-from rollout import collect_rollout_groups
+from rollout import collect_rollout_groups, generate_rollouts
 from batching import collate_groups
 from learner import train_step, score_batch
 
@@ -66,15 +66,12 @@ class SyncWorker:
             "reward_mean": batch["rewards"].mean().item(),
             "equal_reward_group_fraction": sum(
                 len({trajectory.reward for trajectory in group.trajectories}) == 1
-                for group in groups
-            ) / len(groups),
+                for group in groups) / len(groups),
             "truncated_fraction": sum(
-                trajectory.finish_reason == "length" for trajectory in trajectories
-            ) / len(trajectories),
+                trajectory.finish_reason == "length" for trajectory in trajectories) / len(trajectories),
             "policy_lag_max": max(self.learner_step - group.source_learner_step for group in groups),
-            # same weights score the same tokens, so this is ~0 unless the plumbing is off
             "logprob_gap_mean": (proximal_logprobs[mask] - behavior).abs().mean().item(),
-            # mean NLL of sampled tokens: an entropy proxy
+            # mean NLL of sampled tokens -
             "sampled_nll": -behavior.mean().item(),
             "response_len": mask.sum(1).float().mean().item(),
         })
@@ -105,15 +102,17 @@ class SyncWorker:
         if not inputs:
             raise ValueError("Evaluation needs at least one prompt")
         rewards, truncated, parse_failures, samples = [], 0, 0, []
-        for task, inp_prompt in inputs:
-            prompt = {key: value.to(self.device) for key, value in inp_prompt.items()}
-            output = self.model.generate(
-                **prompt, do_sample=False, max_new_tokens=max_samples_per_gen,
-                repetition_penalty=1.0,
-                pad_token_id=self.pad_token_id,
-                eos_token_id=list(self.eos_token_ids),
-            )
-            response_ids = output[0, prompt["input_ids"].shape[1]:].tolist()
+        rollouts = generate_rollouts(
+            [inp_prompt["input_ids"][0].to(self.device) for _, inp_prompt in inputs],
+            self.model,
+            num_gens=1,
+            max_samples_per_gen=max_samples_per_gen,
+            eos_token_ids=self.eos_token_ids,
+            pad_token_id=self.pad_token_id,
+            greedy=True,
+        )
+        for (task, inp_prompt), rollout in zip(inputs, rollouts):
+            response_ids = rollout["response_ids"]
             text = self.tokenizer.decode(response_ids, skip_special_tokens=True)
             reward = float(self.score_fn(task, text))
             rewards.append(reward)
