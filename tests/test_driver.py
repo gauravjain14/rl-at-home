@@ -15,11 +15,15 @@ class DriverTests(unittest.IsolatedAsyncioTestCase):
         events, version = [], 0
 
         async def collect(**args):
-            self.assertEqual(args["input_prompt"], [[args["task"]]])
+            # one batched call per step; groups are numbered from group_id
+            self.assertEqual(args["input_prompts"], [[[task]] for task in args["tasks"]])
             self.assertEqual(args["max_samples_per_gen"], 512)
-            events.append(("collect", args["group_id"], version))
+            groups = []
+            for i in range(len(args["tasks"])):
+                events.append(("collect", args["group_id"] + i, version))
+                groups.append(RolloutGroup(args["group_id"] + i, 0, args["run_epoch"], version, 0, []))
             await asyncio.sleep(0)
-            return RolloutGroup(args["group_id"], 0, args["run_epoch"], version, 0, [])
+            return groups
 
         async def train(groups):
             nonlocal version
@@ -136,7 +140,7 @@ class DriverTests(unittest.IsolatedAsyncioTestCase):
         for stage in ("collect_group", "train_groups"):
             with self.subTest(stage=stage):
                 worker = SimpleNamespace(**{
-                    name: SimpleNamespace(remote=AsyncMock(return_value=object()))
+                    name: SimpleNamespace(remote=AsyncMock(return_value=[object()]))
                     for name in ("collect_group", "train_groups", "save_checkpoint")
                 })
                 getattr(worker, stage).remote.side_effect = RuntimeError(stage)
