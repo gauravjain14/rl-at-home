@@ -293,7 +293,7 @@ if __name__ == "__main__":
         # Single source for settings used by both the code and the logged config.
         num_gens, learning_rate, groups_per_batch, checkpoint_every = 8, 1e-6, 16, 25
         seed, max_samples_per_gen, num_train_steps = 42, 512, None
-        micro_batch_size, ppo_epochs, num_minibatches = 1, 1, 1
+        micro_batch_size, update_epochs, num_minibatches = 1, 1, 1
         gradient_checkpointing = False
         task_name = sys.argv[1] if len(sys.argv) > 1 else "gsm8k"
         if task_name == "music":
@@ -303,8 +303,9 @@ if __name__ == "__main__":
             model=model, device="cuda:0", pad_token_id=tokenizer.pad_token_id,
             tokenizer=tokenizer, score_fn=task.score, num_gens=num_gens,
             answer_parser=task.parse, lr=learning_rate, seed=seed,
-            micro_batch_size=micro_batch_size, ppo_epochs=ppo_epochs,
-            num_minibatches=num_minibatches, gradient_checkpointing=gradient_checkpointing,
+            micro_batch_size=micro_batch_size, update_epochs=update_epochs,
+            num_minibatches=num_minibatches,
+            gradient_checkpointing=gradient_checkpointing,
         )
         del model  # Release the driver's CPU copy after submitting it to Ray.
         start_step = ray.get(sync_worker.load_trainer_state.remote(resume_from)) if resume_from else 0
@@ -323,7 +324,7 @@ if __name__ == "__main__":
         run_config = {
             "model": model_name, "task": task_name, "num_gens": num_gens,
             "groups_per_batch": groups_per_batch, "micro_batch_size": micro_batch_size,
-            "ppo_epochs": ppo_epochs, "num_minibatches": num_minibatches,
+            "update_epochs": update_epochs, "num_minibatches": num_minibatches,
             "gradient_checkpointing": gradient_checkpointing,
             "learning_rate": learning_rate,
             "dtype": "float32", "temperature": 1.0, "seed": seed,
@@ -335,7 +336,8 @@ if __name__ == "__main__":
         }
         with wandb.init(
             entity="scratchpad",
-            project="nanoRL",
+            project="nanoRL-release",
+            name="gsm8k-qwen2.5-0.5b-full-ft",
             config=run_config,
         ) as run:
             run.define_metric("learner_step")

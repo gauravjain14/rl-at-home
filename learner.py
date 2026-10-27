@@ -14,7 +14,7 @@ def train_step(model, optimizer, batch, proximal_logprobs, micro_batch_size=1,
         update_epochs x num_minibatches optimizer steps
     """
     if update_epochs < 1 or num_minibatches < 1:
-        raise ValueError("ppo_epochs and num_minibatches must be positive")
+        raise ValueError("update_epochs and num_minibatches must be positive")
     optimizer.zero_grad()
     batch_size = batch["input_ids"].shape[0]
     # compute the advantages for the batch to have them for the entire group

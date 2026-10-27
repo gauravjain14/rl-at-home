@@ -141,7 +141,7 @@ class PPOStepTests(unittest.TestCase):
         steps = []
         optimizer.register_step_post_hook(lambda *args: steps.append(1))
         with patch("learner.torch.randperm", side_effect=torch.arange):
-            metrics = train_step(model, optimizer, self.batch, self.proximal, ppo_epochs=2, num_minibatches=2)
+            metrics = train_step(model, optimizer, self.batch, self.proximal, update_epochs=2, num_minibatches=2)
         self.assertEqual(len(steps), 4)
         # reference: the same four steps, one whole group each. A group's advantages do not
         # depend on the rest of the batch, so train_step on that group alone is the same step.
@@ -167,7 +167,7 @@ class PPOStepTests(unittest.TestCase):
             torch.testing.assert_close(proximal, full)
 
     def test_invalid_update_settings(self):
-        for kwargs in ({"ppo_epochs": 0}, {"num_minibatches": 0}):
+        for kwargs in ({"update_epochs": 0}, {"num_minibatches": 0}):
             with self.subTest(**kwargs), self.assertRaises(ValueError):
                 train_step(TinyPolicy(), Mock(), self.batch, self.proximal, **kwargs)
 

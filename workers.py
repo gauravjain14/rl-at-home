@@ -18,7 +18,7 @@ class SyncWorker:
     # also runs the evals
     def __init__(self, model, device, pad_token_id, learner_step=0,
                  *, tokenizer, score_fn, num_gens=8, answer_parser=None, lr=1e-6,
-                 seed=42, micro_batch_size=1, ppo_epochs=1, num_minibatches=1,
+                 seed=42, micro_batch_size=1, update_epochs=1, num_minibatches=1,
                  gradient_checkpointing=False):
         if not callable(score_fn):
             raise ValueError("score_fn must be callable")
@@ -45,7 +45,7 @@ class SyncWorker:
         self.answer_parser = answer_parser
         self.num_gens = num_gens
         self.micro_batch_size = micro_batch_size
-        self.ppo_epochs = ppo_epochs
+        self.update_epochs = update_epochs
         self.num_minibatches = num_minibatches
 
         eos = self.model.generation_config.eos_token_id
@@ -71,7 +71,7 @@ class SyncWorker:
             batch=batch,
             proximal_logprobs=proximal_logprobs,
             micro_batch_size=self.micro_batch_size,
-            ppo_epochs=self.ppo_epochs,
+            update_epochs=self.update_epochs,
             num_minibatches=self.num_minibatches,
         )
         trajectories = [trajectory for group in groups for trajectory in group.trajectories]
@@ -260,14 +260,14 @@ class RolloutWorker:
 @ray.remote(num_cpus=1, num_gpus=1)
 class LearnerWorker:
     def __init__(self, model, device, pad_token_id, learner_step=0,
-                 *, micro_batch_size=1, ppo_epochs=1, num_minibatches=1):
+                 *, micro_batch_size=1, update_epochs=1, num_minibatches=1):
         self.model = model.to(device=device, dtype=torch.float32).eval()
         self.device = device
         self.optimizer = torch.optim.AdamW(self.model.parameters(), lr=1e-6, weight_decay=0.0)
         self.pad_token_id = pad_token_id
         self.learner_step = learner_step
         self.micro_batch_size = micro_batch_size
-        self.ppo_epochs = ppo_epochs
+        self.update_epochs = update_epochs
         self.num_minibatches = num_minibatches
 
     def train_groups(self, groups):
@@ -283,7 +283,7 @@ class LearnerWorker:
             batch=batch,
             proximal_logprobs=proximal_logprobs,
             micro_batch_size=self.micro_batch_size,
-            ppo_epochs=self.ppo_epochs,
+            update_epochs=self.update_epochs,
             num_minibatches=self.num_minibatches,
         )
 

@@ -186,7 +186,7 @@ class WorkerTests(unittest.TestCase):
             Trajectory([1, 2], [3], [-math.log(8)], [True], 1.0, "stop"),
             Trajectory([1, 2], [4], [-math.log(8)], [True], 0.0, "length"),
         ])
-        settings = {"micro_batch_size": 2, "ppo_epochs": 3, "num_minibatches": 2}
+        settings = {"micro_batch_size": 2, "update_epochs": 3, "num_minibatches": 2}
         model = TinyPolicy()
         model.generation_config = SimpleNamespace(eos_token_id=7)
         sync = SyncWorker.__ray_metadata__.modified_class(
