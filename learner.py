@@ -4,16 +4,16 @@ from losses import token_logprobs, group_advantages, clipped_policy_loss
 
 
 def train_step(model, optimizer, batch, proximal_logprobs, micro_batch_size=1,
-               ppo_epochs=1, num_minibatches=1):
+               update_epochs=1, num_minibatches=1):
     """
         current logprobs - rollout tokens, logprobs from the current trainer policy
         behavior logprobs - logprobs recorded by the generator when sampling those tokens
         proximal logprobs - rollout tokens scored by the frozen proximal learner policy
         advantage - advantage from the rollouts
         loss_mask - mask of the rollouts
-        ppo_epochs x num_minibatches optimizer steps; micro-batches only bound memory
+        update_epochs x num_minibatches optimizer steps
     """
-    if ppo_epochs < 1 or num_minibatches < 1:
+    if update_epochs < 1 or num_minibatches < 1:
         raise ValueError("ppo_epochs and num_minibatches must be positive")
     optimizer.zero_grad()
     batch_size = batch["input_ids"].shape[0]
@@ -28,8 +28,9 @@ def train_step(model, optimizer, batch, proximal_logprobs, micro_batch_size=1,
     minibatch_size = -(-batch_size // num_minibatches)
     losses, grad_norms = [], []
 
-    for epoch in range(ppo_epochs):
-        order = torch.randperm(batch_size) if num_minibatches > 1 else torch.arange(batch_size)
+    for epoch in range(update_epochs):
+        order = torch.randperm(batch_size) if num_minibatches > 1 \
+            else torch.arange(batch_size)
         for start in range(0, batch_size, minibatch_size):
             rows = order[start:start + minibatch_size]
             total_tokens = batch["loss_mask"][rows, 1:].sum()
