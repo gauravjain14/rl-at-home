@@ -18,12 +18,24 @@ class SyncWorker:
     # also runs the evals
     def __init__(self, model, device, pad_token_id, learner_step=0,
                  *, tokenizer, score_fn, num_gens=8, answer_parser=None, lr=1e-6,
-                 seed=42, micro_batch_size=1, ppo_epochs=1, num_minibatches=1):
+                 seed=42, micro_batch_size=1, ppo_epochs=1, num_minibatches=1,
+                 gradient_checkpointing=False):
         if not callable(score_fn):
             raise ValueError("score_fn must be callable")
 
         torch.manual_seed(seed)
         self.model = model.to(device=device, dtype=torch.float32).eval()
+        for module in self.model.modules():
+            # remove the dropout. Otherwise how do you compare proximal logprobs
+            # with current logprobs and so on. Right?
+            if isinstance(module, torch.nn.Dropout):
+                module.p = 0.0
+            if hasattr(module, "attention_dropout"):
+                module.attention_dropout = 0.0
+        # recompute layer activations in backward: long sequences fit in memory, slower step
+        self.gradient_checkpointing = gradient_checkpointing
+        if gradient_checkpointing:
+            self.model.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
         self.device = device
         self.optimizer = torch.optim.AdamW(self.model.parameters(), lr=lr, weight_decay=0.0)
         self.pad_token_id = pad_token_id
@@ -45,9 +57,14 @@ class SyncWorker:
         # collate the groups and do a trainer step
         batch = collate_groups(groups, pad_token_id=self.pad_token_id)
         batch = {key: value.to(self.device) for key, value in batch.items()}
-
         proximal_logprobs = score_proximal(self.model, batch, self.micro_batch_size)
 
+        if self.gradient_checkpointing:
+            # HF only checkpoints in train mode.
+            # because we get current logprobs, proximal logprobs and what not,
+            # generally we should have dropout, batchnorm, any other probabilistic
+            # factor in training off. At least I think so.
+            self.model.train()
         metrics = train_step(
             model=self.model,
             optimizer=self.optimizer,
@@ -148,6 +165,13 @@ class SyncWorker:
             "optimizer": self.optimizer.state_dict(),
         }, path / "trainer.pt")
         return str(path)
+
+    def load_trainer_state(self, path):
+        # the weights are loaded with the model; this restores what save_checkpoint adds
+        state = torch.load(Path(path) / "trainer.pt", map_location=self.device, weights_only=True)
+        self.optimizer.load_state_dict(state["optimizer"])
+        self.learner_step = state["learner_step"]
+        return self.learner_step
 
 
 @ray.remote(num_cpus=1, num_gpus=1)

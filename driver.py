@@ -3,9 +3,11 @@ orchestrator of the behavior, learner, environments and verifier
 """
 import torch
 import asyncio
+import itertools
 import json
 import ray
 import shutil
+import sys
 import time
 from pathlib import Path
 from transformers import AutoTokenizer, AutoModelForCausalLM
@@ -102,7 +104,8 @@ async def main(sync_worker,
                checkpoint_dir=None,
                wandb_run=None,
                checkpoint_every=100,
-               run_config=None):
+               run_config=None,
+               start_step=0):
     if groups_per_batch < 1 or checkpoint_every < 1 or (
         num_train_steps is not None and num_train_steps < 1
     ):
@@ -168,10 +171,11 @@ async def main(sync_worker,
             }, indent=2))
         return scores
 
-    before = await evaluate(0)
-    last_eval, last_checkpoint_step = before, 0
+    # a resumed run was already evaluated at start_step
+    before = await evaluate(0) if start_step == 0 else None
+    last_eval, last_checkpoint_step = before, start_step
 
-    step = 0
+    step = start_step
     group_id = 0
     metrics = {}
     for input_batch in train_batches:
@@ -279,23 +283,31 @@ if __name__ == "__main__":
         tokenizer = AutoTokenizer.from_pretrained(model_name)
         if tokenizer.pad_token_id is None:
             tokenizer.pad_token = tokenizer.eos_token
+        # resume: python driver.py <task> <checkpoints/.../step-N>
+        resume_from = str(Path(sys.argv[2]).resolve()) if len(sys.argv) > 2 else None
         model = AutoModelForCausalLM.from_pretrained(
-            model_name, dtype=torch.float32, attn_implementation="sdpa",
+            resume_from or model_name,
+            dtype=torch.float32,
+            attn_implementation="sdpa",
         )
         # Single source for settings used by both the code and the logged config.
         num_gens, learning_rate, groups_per_batch, checkpoint_every = 8, 1e-6, 16, 25
         seed, max_samples_per_gen, num_train_steps = 42, 512, None
         micro_batch_size, ppo_epochs, num_minibatches = 1, 1, 1
-        task_name = "gsm8k"
+        gradient_checkpointing = False
+        task_name = sys.argv[1] if len(sys.argv) > 1 else "gsm8k"
+        if task_name == "music":
+            max_samples_per_gen, gradient_checkpointing = 2048, True
         task = get_task(task_name)
         sync_worker = SyncWorker.remote(
             model=model, device="cuda:0", pad_token_id=tokenizer.pad_token_id,
             tokenizer=tokenizer, score_fn=task.score, num_gens=num_gens,
             answer_parser=task.parse, lr=learning_rate, seed=seed,
             micro_batch_size=micro_batch_size, ppo_epochs=ppo_epochs,
-            num_minibatches=num_minibatches,
+            num_minibatches=num_minibatches, gradient_checkpointing=gradient_checkpointing,
         )
         del model  # Release the driver's CPU copy after submitting it to Ray.
+        start_step = ray.get(sync_worker.load_trainer_state.remote(resume_from)) if resume_from else 0
         # learner_worker = LearnerWorker.remote(
         #     model=model, device="cuda:0", pad_token_id=tokenizer.pad_token_id,
         # )
@@ -312,12 +324,14 @@ if __name__ == "__main__":
             "model": model_name, "task": task_name, "num_gens": num_gens,
             "groups_per_batch": groups_per_batch, "micro_batch_size": micro_batch_size,
             "ppo_epochs": ppo_epochs, "num_minibatches": num_minibatches,
+            "gradient_checkpointing": gradient_checkpointing,
             "learning_rate": learning_rate,
             "dtype": "float32", "temperature": 1.0, "seed": seed,
             "validation_size": getattr(task, "validation_size", None),
             "split_seed": getattr(task, "split_seed", None),
             "max_samples_per_gen": max_samples_per_gen, "checkpoint_every": checkpoint_every,
             "num_train_steps": num_train_steps, "step_unit": "training_batches",
+            "resumed_from": resume_from, "start_step": start_step,
         }
         with wandb.init(
             entity="scratchpad",
@@ -329,11 +343,14 @@ if __name__ == "__main__":
             run.define_metric("eval/*", step_metric="learner_step")
             result = asyncio.run(main(
                 sync_worker=sync_worker,
-                train_batches=task.batches(tokenizer, batch_size=groups_per_batch),
+                # the task order is fixed by its seed, so skipping the trained batches resumes exactly
+                train_batches=itertools.islice(task.batches(tokenizer, batch_size=groups_per_batch),
+                                               start_step, None),
                 num_train_steps=num_train_steps, groups_per_batch=groups_per_batch,
                 max_samples_per_gen=max_samples_per_gen,
                 task_name=task_name, eval_inputs=eval_inputs, checkpoint_dir=checkpoint_dir,
                 wandb_run=run, checkpoint_every=checkpoint_every, run_config=run_config,
+                start_step=start_step,
             ))
         with (checkpoint_dir / "run_metrics.json").open("w") as output:
             json.dump(result, output, indent=2)

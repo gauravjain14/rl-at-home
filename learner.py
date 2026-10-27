@@ -29,7 +29,6 @@ def train_step(model, optimizer, batch, proximal_logprobs, micro_batch_size=1,
     losses, grad_norms = [], []
 
     for epoch in range(ppo_epochs):
-        # a single minibatch keeps the batch order
         order = torch.randperm(batch_size) if num_minibatches > 1 else torch.arange(batch_size)
         for start in range(0, batch_size, minibatch_size):
             rows = order[start:start + minibatch_size]

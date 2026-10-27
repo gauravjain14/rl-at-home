@@ -1,3 +1,4 @@
+import copy
 import json
 import math
 import tempfile
@@ -216,3 +217,52 @@ class WorkerTests(unittest.TestCase):
              "num_gens": 4, "eos_token_ids": (9,), "pad_token_id": 5},
         )
         self.assertEqual([p.tolist() for p in kwargs["input_prompts"]], [[[1, 2]]])
+
+    def test_gradient_checkpointing_gives_the_same_update(self):
+        from transformers import Qwen2Config, Qwen2ForCausalLM
+        torch.manual_seed(0)
+        base = Qwen2ForCausalLM(Qwen2Config(vocab_size=32, hidden_size=16, intermediate_size=32,
+                                            num_hidden_layers=2, num_attention_heads=2,
+                                            num_key_value_heads=2, max_position_embeddings=64))
+        group = RolloutGroup(0, 0, 0, 0, 0, [
+            Trajectory([1, 2, 3], [4, 5], [-1.0, -1.0], [True, True], 1.0, "stop"),
+            Trajectory([1, 2, 3], [6], [-1.0], [True], 0.0, "length"),
+        ])
+        cls = SyncWorker.__ray_metadata__.modified_class
+        updated = []
+        for checkpointing in (False, True):
+            model = copy.deepcopy(base)
+            worker = cls(model, "cpu", 0, tokenizer=Mock(eos_token_id=31), score_fn=gsm8k.score,
+                         gradient_checkpointing=checkpointing)
+            self.assertEqual(model.is_gradient_checkpointing, checkpointing)
+            worker.train_groups([group])
+            self.assertEqual(model.training, checkpointing)  # train mode only when checkpointing
+            updated.append([p.detach().clone() for p in model.parameters()])
+        for plain, checkpointed in zip(*updated):
+            torch.testing.assert_close(plain, checkpointed)
+
+    def test_load_trainer_state_restores_what_save_checkpoint_wrote(self):
+        cls = SyncWorker.__ray_metadata__.modified_class
+        group = RolloutGroup(0, 0, 0, 0, 0, [
+            Trajectory([1, 2], [3], [-math.log(8)], [True], 1.0, "stop"),
+            Trajectory([1, 2], [4], [-math.log(8)], [True], 0.0, "length"),
+        ])
+
+        def make_worker():
+            model = TinyPolicy()
+            model.generation_config = SimpleNamespace(eos_token_id=7)
+            model.save_pretrained = Mock()
+            return cls(model, "cpu", 0, tokenizer=Mock(), score_fn=gsm8k.score)
+
+        trained, resumed = make_worker(), make_worker()
+        trained.train_groups([group])
+        trained.train_groups([group])
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "checkpoint"
+            trained.save_checkpoint(path)
+            self.assertEqual(resumed.load_trainer_state(path), 2)
+        self.assertEqual(resumed.learner_step, 2)
+        saved, loaded = trained.optimizer.state_dict(), resumed.optimizer.state_dict()
+        self.assertEqual(saved["param_groups"], loaded["param_groups"])
+        for key in ("step", "exp_avg", "exp_avg_sq"):
+            torch.testing.assert_close(saved["state"][0][key], loaded["state"][0][key])

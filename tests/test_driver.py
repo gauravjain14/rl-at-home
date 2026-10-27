@@ -163,3 +163,16 @@ class DriverTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(calls, [(["a"], [1], 0, 4), (["b"], [2], 1, 4), (["c"], [3], 2, 4)])
         self.assertEqual([group.group_id for group in buffer.buffer], [0, 1, 2])
         self.assertTrue(buffer.closed)
+
+    async def test_resume_continues_step_numbering_without_a_step_zero_eval(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / "run"
+            result, events = await self.drive(
+                2, num_train_steps=None, groups_per_batch=1, checkpoint_every=25,
+                eval_inputs=[({"question_id": 7}, {})], checkpoint_dir=root, start_step=24,
+            )
+            self.assertEqual({path.name for path in root.glob("step-*")}, {"step-000025", "step-000026"})
+        self.assertEqual([e for e in events if e[0] in ("evaluate", "save")],
+                         [("save", 1), ("evaluate", 1), ("save", 2), ("evaluate", 2)])
+        self.assertEqual(result["learner_step"], 26)
+        self.assertIsNone(result["eval_before"])
