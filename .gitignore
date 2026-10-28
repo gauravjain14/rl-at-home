@@ -1,0 +1,7 @@
+__pycache__/
+*.pyc
+wandb/
+checkpoints/
+*.log
+*.pt
+eval_results.json
