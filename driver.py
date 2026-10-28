@@ -14,7 +14,7 @@ from transformers import AutoTokenizer, AutoModelForCausalLM
 
 from learner import score_batch
 from batching import collate_groups
-from rollout import collect_rollout_groups
+from rollout import collect_rollout_groups, HFGenerator
 from buffer import RolloutBuffer, BufferClosed
 from workers import RolloutWorker, LearnerWorker, SyncWorker
 from tasks import get_task
@@ -295,6 +295,8 @@ if __name__ == "__main__":
         seed, max_samples_per_gen, num_train_steps = 42, 512, None
         micro_batch_size, update_epochs, num_minibatches = 1, 1, 1
         gradient_checkpointing = False
+        # swap in another engine here: any class with generate() and sync()
+        generator_cls = HFGenerator
         task_name = sys.argv[1] if len(sys.argv) > 1 else "gsm8k"
         if task_name == "music":
             max_samples_per_gen, gradient_checkpointing = 2048, True
@@ -305,7 +307,7 @@ if __name__ == "__main__":
             answer_parser=task.parse, lr=learning_rate, seed=seed,
             micro_batch_size=micro_batch_size, update_epochs=update_epochs,
             num_minibatches=num_minibatches,
-            gradient_checkpointing=gradient_checkpointing,
+            gradient_checkpointing=gradient_checkpointing, generator_cls=generator_cls,
         )
         del model  # Release the driver's CPU copy after submitting it to Ray.
         start_step = ray.get(sync_worker.load_trainer_state.remote(resume_from)) if resume_from else 0
@@ -326,6 +328,7 @@ if __name__ == "__main__":
             "groups_per_batch": groups_per_batch, "micro_batch_size": micro_batch_size,
             "update_epochs": update_epochs, "num_minibatches": num_minibatches,
             "gradient_checkpointing": gradient_checkpointing,
+            "generator": generator_cls.__name__,
             "learning_rate": learning_rate,
             "dtype": "float32", "temperature": 1.0, "seed": seed,
             "validation_size": getattr(task, "validation_size", None),

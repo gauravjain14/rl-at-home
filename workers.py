@@ -19,7 +19,7 @@ class SyncWorker:
     def __init__(self, model, device, pad_token_id, learner_step=0,
                  *, tokenizer, score_fn, num_gens=8, answer_parser=None, lr=1e-6,
                  seed=42, micro_batch_size=1, update_epochs=1, num_minibatches=1,
-                 gradient_checkpointing=False):
+                 gradient_checkpointing=False, generator_cls=HFGenerator):
         if not callable(score_fn):
             raise ValueError("score_fn must be callable")
 
@@ -52,7 +52,8 @@ class SyncWorker:
         if eos is None:
             eos = self.tokenizer.eos_token_id
         self.eos_token_ids = (eos,) if isinstance(eos, int) else tuple(eos or ())
-        self.generator = HFGenerator(self.model, self.eos_token_ids, self.pad_token_id)
+        # any class with generate() and sync(); built inside the actor so engines live on its GPU
+        self.generator = generator_cls(self.model, self.eos_token_ids, self.pad_token_id)
 
     def train_groups(self, groups):
         # collate the groups and do a trainer step
@@ -174,7 +175,7 @@ class SyncWorker:
 
 @ray.remote(num_cpus=1, num_gpus=1)
 class RolloutWorker:
-    def __init__(self, model_name, score_fn, num_gens=4):
+    def __init__(self, model_name, score_fn, num_gens=4, generator_cls=HFGenerator):
         if not callable(score_fn):
             raise ValueError("score_fn must be callable")
 
@@ -197,7 +198,7 @@ class RolloutWorker:
         if eos is None:
             eos = self.tokenizer.eos_token_id
         self.eos_token_ids = (eos,) if isinstance(eos, int) else tuple(eos or ())
-        self.generator = HFGenerator(self.model, self.eos_token_ids, self.tokenizer.pad_token_id)
+        self.generator = generator_cls(self.model, self.eos_token_ids, self.tokenizer.pad_token_id)
 
 
     def collect_group(self, tasks, input_prompts, *, group_id, run_epoch,

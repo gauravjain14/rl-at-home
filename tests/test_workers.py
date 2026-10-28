@@ -17,6 +17,23 @@ from test_learner import TinyPolicy
 from workers import LearnerWorker, RolloutWorker, SyncWorker
 
 
+class FakeGenerator:
+    """Stands in for any engine (vLLM, SGLang, ...): only generate() and sync()."""
+
+    def __init__(self, model, eos_token_ids=(), pad_token_id=0):
+        self.model, self.eos_token_ids, self.pad_token_id = model, eos_token_ids, pad_token_id
+        self.calls, self.synced = [], []
+
+    def generate(self, input_prompts, num_gens=1, max_samples_per_gen=8192, greedy=False):
+        self.calls.append((len(input_prompts), num_gens, max_samples_per_gen, greedy))
+        rows = [{"response_ids": [3, 7], "behavior_logprobs": [-math.log(8)] * 2, "finish_reason": "stop"},
+                {"response_ids": [4], "behavior_logprobs": [-math.log(8)], "finish_reason": "length"}]
+        return [rows[i % 2] for _ in input_prompts for i in range(num_gens)]
+
+    def sync(self, model):
+        self.synced.append(model)
+
+
 class WorkerTests(unittest.TestCase):
     def test_sync_worker_shares_model_and_tracks_updates(self):
         cls = SyncWorker.__ray_metadata__.modified_class
@@ -40,7 +57,9 @@ class WorkerTests(unittest.TestCase):
             self.assertEqual(worker.collect_group([task], [prompt], group_id=0, run_epoch=0), [group])
             self.assertEqual(collect.call_args.kwargs["source_learner_step"], 0)
             self.assertEqual(collect.call_args.kwargs["tasks"], [task])
-            self.assertEqual(collect.call_args.kwargs["pad_token_id"], 0)
+            self.assertIs(collect.call_args.kwargs["generator"], worker.generator)
+            self.assertIs(worker.generator.model, model)
+            self.assertEqual((worker.generator.eos_token_ids, worker.generator.pad_token_id), ((6, 7), 0))
             metrics = worker.train_groups([group])
             self.assertGreater(metrics["grad_norm"], 0)
             self.assertGreater(model.logits.abs().sum().item(), 0)
@@ -48,12 +67,12 @@ class WorkerTests(unittest.TestCase):
             self.assertAlmostEqual(metrics["sampled_nll"], math.log(8), places=6)
             self.assertEqual(metrics["response_len"], 1.0)
             worker.collect_group([task], [prompt], group_id=1, run_epoch=0)
-            for key, expected in (("behavior_policy", model), ("tokenizer", tokenizer),
+            for key, expected in (("generator", worker.generator), ("tokenizer", tokenizer),
                                   ("score_fn", gsm8k.score), ("source_learner_step", 1),
-                                  ("num_gens", 2), ("eos_token_ids", (6, 7))):
+                                  ("num_gens", 2)):
                 self.assertEqual(collect.call_args.kwargs[key], expected)
         tokenizer.decode.return_value = r"\boxed{42}"
-        with patch("workers.generate_rollouts", return_value=[{"response_ids": [3, 7]}]):
+        with patch.object(worker.generator, "generate", return_value=[{"response_ids": [3, 7]}]):
             self.assertEqual(worker.evaluate([(task, {"input_ids": prompt})]), {
                 "accuracy": 1.0, "truncated_fraction": 0.0, "num_examples": 1, "policy_version": 1,
             })
@@ -106,7 +125,7 @@ class WorkerTests(unittest.TestCase):
         task = {"question_id": 9, "answer": "42", "prompt": [{"role": "user", "content": "Question"}]}
         inputs = [(task, {"input_ids": torch.tensor([[1, 2]])})] * 2
         with tempfile.TemporaryDirectory() as directory, \
-                patch("workers.generate_rollouts", return_value=rollouts) as generate:
+                patch.object(worker.generator, "generate", return_value=rollouts) as generate:
             path = Path(directory) / "eval.json"
             metrics = worker.evaluate(inputs, 2, output_path=path)
             data = json.loads(path.read_text())
@@ -128,6 +147,7 @@ class WorkerTests(unittest.TestCase):
         learner = learner_cls(TinyPolicy(), "cpu", pad_token_id=0)
         rollout = rollout_cls.__new__(rollout_cls)
         rollout.model, rollout.device, rollout.policy_version = TinyPolicy(), "cpu", 0
+        rollout.generator = Mock()
         initial = learner.export_weights()
         group = RolloutGroup(0, 0, 0, 0, 0, [
             Trajectory([1, 2], [3], [-math.log(8)], [True], 1.0, "stop"),
@@ -145,6 +165,7 @@ class WorkerTests(unittest.TestCase):
         with patch("workers.torch.cuda.synchronize") as synchronize:
             self.assertEqual(rollout.load_weights(learner.export_weights()), 1)
             self.assertEqual(synchronize.call_count, 2)
+            rollout.generator.sync.assert_called_once_with(rollout.model)
             torch.testing.assert_close(rollout.model.logits, learner.model.logits)
             with self.assertRaises(ValueError):
                 rollout.load_weights(initial)
@@ -205,16 +226,17 @@ class WorkerTests(unittest.TestCase):
         worker = cls.__new__(cls)
         worker.device, worker.policy_version, worker.num_gens, worker.eos_token_ids = "cpu", 3, 4, (9,)
         worker.model, worker.tokenizer, worker.score_fn = TinyPolicy(), Mock(pad_token_id=5), gsm8k.score
+        worker.generator = Mock()
         group = RolloutGroup(7, 0, 1, 3, 0, [])
         with patch("workers.collect_rollout_groups", return_value=[group]) as collect:
             self.assertEqual(worker.collect_group([{"answer": "1"}], [torch.tensor([[1, 2]])],
                                                   group_id=7, run_epoch=1), [group])
         kwargs = collect.call_args.kwargs
         self.assertEqual(
-            {k: kwargs[k] for k in ("tasks", "group_id", "run_epoch", "source_learner_step",
-                                    "num_gens", "eos_token_ids", "pad_token_id")},
-            {"tasks": [{"answer": "1"}], "group_id": 7, "run_epoch": 1, "source_learner_step": 3,
-             "num_gens": 4, "eos_token_ids": (9,), "pad_token_id": 5},
+            {k: kwargs[k] for k in ("tasks", "generator", "group_id", "run_epoch",
+                                    "source_learner_step", "num_gens")},
+            {"tasks": [{"answer": "1"}], "generator": worker.generator, "group_id": 7, "run_epoch": 1,
+             "source_learner_step": 3, "num_gens": 4},
         )
         self.assertEqual([p.tolist() for p in kwargs["input_prompts"]], [[[1, 2]]])
 
@@ -266,3 +288,30 @@ class WorkerTests(unittest.TestCase):
         self.assertEqual(saved["param_groups"], loaded["param_groups"])
         for key in ("step", "exp_avg", "exp_avg_sq"):
             torch.testing.assert_close(saved["state"][0][key], loaded["state"][0][key])
+
+    def test_any_generator_with_generate_and_sync_drives_the_worker(self):
+        cls = SyncWorker.__ray_metadata__.modified_class
+        model = TinyPolicy()
+        model.generation_config = SimpleNamespace(eos_token_id=7)
+        tokenizer = Mock()
+        tokenizer.decode.side_effect = lambda ids, skip_special_tokens: r"\boxed{42}" if ids == [3, 7] else "no"
+        worker = cls(model, "cpu", 0, tokenizer=tokenizer, score_fn=gsm8k.score, num_gens=2,
+                     generator_cls=FakeGenerator)
+        fake = worker.generator
+        self.assertIsInstance(fake, FakeGenerator)
+        self.assertEqual((fake.model, fake.eos_token_ids, fake.pad_token_id), (model, (7,), 0))
+        task, prompt = {"answer": "42"}, torch.tensor([[1, 2]])
+
+        groups = worker.collect_group([task], [prompt], group_id=0, run_epoch=0)
+        self.assertEqual(fake.calls, [(1, 2, 1024, False)])
+        trajectories = groups[0].trajectories
+        self.assertEqual([(t.response_ids, t.reward, t.finish_reason) for t in trajectories],
+                         [([3, 7], 1.0, "stop"), ([4], 0.0, "length")])
+        self.assertIsNone(trajectories[0].debug_logp)  # engines need not return debug log-probs
+
+        metrics = worker.train_groups(groups)
+        self.assertGreater(metrics["grad_norm"], 0)
+        self.assertEqual(fake.synced, [model])  # new weights go to the engine after the update
+
+        self.assertEqual(worker.evaluate([(task, {"input_ids": prompt})])["accuracy"], 1.0)
+        self.assertEqual(fake.calls[-1], (1, 1, 512, True))

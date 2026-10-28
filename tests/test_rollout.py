@@ -6,7 +6,7 @@ import torch
 from transformers import Qwen2Config, Qwen2ForCausalLM
 
 from batching import collate_groups
-from rollout import collect_rollout_groups, generate_rollouts
+from rollout import HFGenerator, collect_rollout_groups, generate_rollouts
 
 
 class ScriptedPolicy(torch.nn.Module):
@@ -71,9 +71,10 @@ class RolloutTests(unittest.TestCase):
         score_fn = Mock(side_effect=[1.0, 0.0, 0.5, 0.25])
         kwargs = dict(
             tasks=tasks, input_prompts=[torch.tensor([[0, 1, 2]]), torch.tensor([[3, 4]])],
-            behavior_policy=ScriptedPolicy([[2, 7], [3, 7], [4, 7], [5, 7]]), tokenizer=tokenizer,
-            score_fn=score_fn, group_id=9, attempt_id=2, run_epoch=3, source_learner_step=7,
-            num_gens=2, max_samples_per_gen=5, eos_token_ids=(7,), pad_token_id=0,
+            generator=HFGenerator(ScriptedPolicy([[2, 7], [3, 7], [4, 7], [5, 7]]),
+                                  eos_token_ids=(7,), pad_token_id=0),
+            tokenizer=tokenizer, score_fn=score_fn, group_id=9, attempt_id=2, run_epoch=3,
+            source_learner_step=7, num_gens=2, max_samples_per_gen=5,
         )
         with patch("rollout.time.time", return_value=123.0):
             groups = collect_rollout_groups(**kwargs)
