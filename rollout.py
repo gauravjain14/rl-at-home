@@ -8,6 +8,31 @@ from protocol import Trajectory, RolloutGroup
 # keep full-vocab log-probs of every step on each trajectory (~0.6 MB per row per step)
 DEBUG_LOGP = False
 
+class HFGenerator:
+    def __init__(self, model, eos_token_ids=(), pad_token_id=0):
+        self.model = model
+        self.eos_token_ids = eos_token_ids
+        self.pad_token_id = pad_token_id
+    
+    def generate(self, input_prompts,
+                    num_gens=1,
+                    max_samples_per_gen=8192,
+                    greedy=False):
+        return generate_rollouts(
+            input_prompts=input_prompts,
+            behavior_policy=self.model,
+            num_gens=num_gens,
+            max_samples_per_gen=max_samples_per_gen,
+            eos_token_ids=self.eos_token_ids,
+            pad_token_id=self.pad_token_id,
+            greedy=greedy
+        )
+    
+    def sync(self, model):
+        # not needed yet.
+        pass
+
+
 @torch.no_grad()
 def generate_rollouts(input_prompts,
                     behavior_policy,
@@ -82,11 +107,10 @@ def generate_rollouts(input_prompts,
     } for j, n in enumerate(lengths.tolist())]
 
 def collect_rollout_groups(
-        tasks, input_prompts, behavior_policy,
+        tasks, input_prompts, generator,
         tokenizer, score_fn,
         *, group_id, run_epoch, source_learner_step,
-        attempt_id=0, num_gens=4, max_samples_per_gen=128,
-        eos_token_ids=(), pad_token_id=0
+        attempt_id=0, num_gens=4, max_samples_per_gen=128
 ) -> RolloutGroup:
     """Generate and score responses to one unpadded prompt shaped [1, P].
 
@@ -102,13 +126,10 @@ def collect_rollout_groups(
     created_at = time.time()
     # not padded here
     prompts = [inp_prompt[0] for inp_prompt in input_prompts]
-    rollouts = generate_rollouts(
+    rollouts = generator.generate(
         prompts,
-        behavior_policy,
         num_gens=num_gens,
         max_samples_per_gen=max_samples_per_gen,
-        eos_token_ids=eos_token_ids,
-        pad_token_id=pad_token_id
     )
 
     groups = []
@@ -128,7 +149,7 @@ def collect_rollout_groups(
                 loss_mask=[True] * len(response_ids),
                 reward=reward,
                 finish_reason=rollout["finish_reason"],
-                logp=rollout["debug_logp"],
+                logp=rollout.get("debug_logp"),
             ))
 
         groups.append(RolloutGroup(

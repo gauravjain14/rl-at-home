@@ -4,7 +4,7 @@ import ray
 from pathlib import Path
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
-from rollout import collect_rollout_groups, generate_rollouts
+from rollout import collect_rollout_groups, HFGenerator
 from batching import collate_groups
 from learner import train_step, score_proximal
 
@@ -52,6 +52,7 @@ class SyncWorker:
         if eos is None:
             eos = self.tokenizer.eos_token_id
         self.eos_token_ids = (eos,) if isinstance(eos, int) else tuple(eos or ())
+        self.generator = HFGenerator(self.model, self.eos_token_ids, self.pad_token_id)
 
     def train_groups(self, groups):
         # collate the groups and do a trainer step
@@ -91,6 +92,8 @@ class SyncWorker:
             "response_len": mask.sum(1).float().mean().item(),
         })
         self.learner_step += 1
+        # this is a no-op for hfgenerator.
+        self.generator.sync(self.model)
         return metrics
 
     def collect_group(self, tasks, input_prompts, *, group_id, run_epoch,
@@ -99,7 +102,7 @@ class SyncWorker:
         rollout_groups = collect_rollout_groups(
             tasks=tasks,
             input_prompts=inputs,
-            behavior_policy=self.model,
+            generator=self.generator,
             tokenizer=self.tokenizer,
             score_fn=self.score_fn,
             group_id=group_id,
@@ -107,8 +110,6 @@ class SyncWorker:
             source_learner_step=self.learner_step,
             num_gens=self.num_gens,
             max_samples_per_gen=max_samples_per_gen,
-            eos_token_ids=self.eos_token_ids,
-            pad_token_id=self.pad_token_id,
         )
         return rollout_groups
 
@@ -117,13 +118,10 @@ class SyncWorker:
         if not inputs:
             raise ValueError("Evaluation needs at least one prompt")
         rewards, truncated, parse_failures, samples = [], 0, 0, []
-        rollouts = generate_rollouts(
+        rollouts = self.generator.generate(
             [inp_prompt["input_ids"][0].to(self.device) for _, inp_prompt in inputs],
-            self.model,
             num_gens=1,
             max_samples_per_gen=max_samples_per_gen,
-            eos_token_ids=self.eos_token_ids,
-            pad_token_id=self.pad_token_id,
             greedy=True,
         )
         for (task, inp_prompt), rollout in zip(inputs, rollouts):
@@ -199,6 +197,7 @@ class RolloutWorker:
         if eos is None:
             eos = self.tokenizer.eos_token_id
         self.eos_token_ids = (eos,) if isinstance(eos, int) else tuple(eos or ())
+        self.generator = HFGenerator(self.model, self.eos_token_ids, self.tokenizer.pad_token_id)
 
 
     def collect_group(self, tasks, input_prompts, *, group_id, run_epoch,
@@ -207,7 +206,7 @@ class RolloutWorker:
         rollout_groups = collect_rollout_groups(
             tasks=tasks,
             input_prompts=inputs,
-            behavior_policy=self.model,
+            generator=self.generator,
             tokenizer=self.tokenizer,
             score_fn=self.score_fn,
             group_id=group_id,
@@ -215,8 +214,6 @@ class RolloutWorker:
             source_learner_step=self.policy_version,
             num_gens=self.num_gens,
             max_samples_per_gen=max_samples_per_gen,
-            eos_token_ids=self.eos_token_ids,
-            pad_token_id=self.tokenizer.pad_token_id,
         )
         return rollout_groups
 
@@ -228,6 +225,7 @@ class RolloutWorker:
         # Ordinary Ray actor methods are serial: no collect_group runs here.
         torch.cuda.synchronize(self.device)
         self.model.load_state_dict(snapshot["state_dict"], strict=True)
+        self.generator.sync(self.model)
         torch.cuda.synchronize(self.device)
         self.policy_version = version
         return self.policy_version

@@ -334,12 +334,19 @@ if __name__ == "__main__":
             "num_train_steps": num_train_steps, "step_unit": "training_batches",
             "resumed_from": resume_from, "start_step": start_step,
         }
+        # a resumed run continues the wandb run its checkpoint was saved from
+        wandb_run_id = (json.loads((Path(resume_from) / "run_config.json").read_text()).get("wandb_run_id")
+                        if resume_from else None)
         with wandb.init(
             entity="scratchpad",
             project="nanoRL-release",
             name="gsm8k-qwen2.5-0.5b-full-ft",
             config=run_config,
+            id=wandb_run_id,
+            resume="must" if wandb_run_id else None,
+            allow_val_change=True,
         ) as run:
+            run_config["wandb_run_id"] = run.id
             run.define_metric("learner_step")
             run.define_metric("train/*", step_metric="learner_step")
             run.define_metric("eval/*", step_metric="learner_step")
