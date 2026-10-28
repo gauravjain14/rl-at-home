@@ -5,6 +5,7 @@ import torch
 import asyncio
 import itertools
 import json
+import os
 import ray
 import shutil
 import sys
@@ -297,10 +298,13 @@ if __name__ == "__main__":
         gradient_checkpointing = False
         # swap in another engine here: any class with generate() and sync()
         generator_cls = HFGenerator
+        
+        # support for two tasks only so far.
         task_name = sys.argv[1] if len(sys.argv) > 1 else "gsm8k"
         if task_name == "music":
             max_samples_per_gen, gradient_checkpointing = 2048, True
         task = get_task(task_name)
+
         sync_worker = SyncWorker.remote(
             model=model, device="cuda:0", pad_token_id=tokenizer.pad_token_id,
             tokenizer=tokenizer, score_fn=task.score, num_gens=num_gens,
@@ -340,10 +344,10 @@ if __name__ == "__main__":
         # a resumed run continues the wandb run its checkpoint was saved from
         wandb_run_id = (json.loads((Path(resume_from) / "run_config.json").read_text()).get("wandb_run_id")
                         if resume_from else None)
+        # logs to your default wandb account; set WANDB_ENTITY / WANDB_PROJECT to change where
         with wandb.init(
-            entity="scratchpad",
-            project="nanoRL-release",
-            name="gsm8k-qwen2.5-0.5b-full-ft",
+            project=os.environ.get("WANDB_PROJECT", "nanoRL"),
+            name=f"{task_name}-{model_name.split('/')[-1]}",
             config=run_config,
             id=wandb_run_id,
             resume="must" if wandb_run_id else None,

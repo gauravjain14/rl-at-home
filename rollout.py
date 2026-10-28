@@ -47,7 +47,6 @@ def generate_rollouts(input_prompts,
     rows = len(input_prompts) * num_gens
     max_prompt_len = max(len(p) for p in input_prompts)
     input_ids = torch.full((rows, max_prompt_len), pad_token_id, device=device)
-    print(input_ids.shape)
     attention_mask = torch.zeros((rows, max_prompt_len), dtype=torch.long, device=device)
     for k, p in enumerate(input_prompts):
         # attention mask for every prompt

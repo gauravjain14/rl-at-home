@@ -1,0 +1,10 @@
+# versions the GSM8K release run used (Python 3.12, CUDA GPU)
+torch==2.5.1
+transformers==5.17.0
+datasets==3.3.2
+ray==2.40.0
+wandb==0.30.0
+
+# tests and figures
+pytest==8.3.5
+matplotlib==3.10.1

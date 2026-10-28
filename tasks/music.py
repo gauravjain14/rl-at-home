@@ -1,3 +1,5 @@
+# EXPERIMENTAL: Qwen2.5-0.5B-Instruct scores zero reward on this task (sampled and greedy),
+# so RL has no signal to learn from yet. It needs reward shaping or a larger model.
 from datasets import load_dataset
 
 from mimo_music.pipeline import compute_score

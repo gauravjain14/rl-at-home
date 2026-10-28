@@ -55,7 +55,6 @@ def rows(split="train"):
                    else range(validation_size, len(dataset)))
         dataset = dataset.select(indices)
     # apply expected chat format on the dataset
-    print(dataset[0])
     for row in dataset:
         # just maintains music-style task formating
         # I don't think this approach is scalable though
