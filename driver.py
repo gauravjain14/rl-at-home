@@ -346,7 +346,7 @@ if __name__ == "__main__":
                         if resume_from else None)
         # logs to your default wandb account; set WANDB_ENTITY / WANDB_PROJECT to change where
         with wandb.init(
-            project=os.environ.get("WANDB_PROJECT", "nanoRL"),
+            project=os.environ.get("WANDB_PROJECT", "rl-at-home"),
             name=f"{task_name}-{model_name.split('/')[-1]}",
             config=run_config,
             id=wandb_run_id,

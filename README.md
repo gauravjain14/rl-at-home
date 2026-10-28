@@ -1,4 +1,4 @@
-# nanoRL
+# rl-at-home
 
 The overarching goal of this repo is to keep it readable - forever (at least one can hope so)
 
@@ -21,7 +21,7 @@ questions, greedy) after one pass over the training set: 460 steps, **13.3 hours
 | Model | GSM8K test | |
 |---|---|---|
 | Qwen2.5-0.5B-Instruct, untrained | 44.2% | |
-| **nanoRL, GRPO full fine-tune** | **54.0%** | +9.8 pts (95% CI +7.0 to +12.5), 243 questions gained, 114 lost |
+| **rl-at-home, GRPO full fine-tune** | **54.0%** | +9.8 pts (95% CI +7.0 to +12.5), 243 questions gained, 114 lost |
 | verl GRPO-LoRA ([published](https://verl.readthedocs.io/en/latest/algo/baseline.html)) | 54.3% | |
 | Zhuang et al. 2025, RL ([arXiv 2506.13404](https://arxiv.org/abs/2506.13404)) | 54.0% | |
 | verl PPO, with a value model (published) | 56.7% | |
@@ -61,10 +61,6 @@ What these mean -
 
 The curve shapes and magnitudes also match verl's public PPO log for the same model
 ([log](https://github.com/eric-haibin-lin/verl-data/blob/experiments/gsm8k/Qwen2.5-0.5B-bsz256_2-prompt1024-resp512-0.567.log))
-
-![Same-seed replay](docs/same_seed_replay.png)
-
-This is just a same-seed replay to establish deterministic runs.
 
 
 ## Quickstart

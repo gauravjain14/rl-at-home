@@ -1,4 +1,4 @@
-"""From nanoRL/: python -B -m unittest discover -s tests -p test_losses.py -v"""
+"""From rl-at-home/: python -B -m unittest discover -s tests -p test_losses.py -v"""
 
 import math
 import unittest

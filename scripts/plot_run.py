@@ -59,7 +59,7 @@ def test_accuracy(out):
     # full GSM8K test split (1,319), greedy. Ours: eval_test.py. Published: verl baseline table
     # (https://verl.readthedocs.io/en/latest/algo/baseline.html) and Zhuang et al. 2025 (arXiv 2506.13404)
     rows = [("Qwen2.5-0.5B-Instruct, untrained", 44.2, "ours"),
-            ("nanoRL, GRPO full fine-tune, 1 GPU", 54.0, "ours"),
+            ("rl-at-home, GRPO full fine-tune, 1 GPU", 54.0, "ours"),
             ("verl GRPO-LoRA (published)", 54.3, "pub"),
             ("Zhuang et al. 2025, RL (published)", 54.0, "pub"),
             ("verl PPO, with value model (published)", 56.7, "pub"),
@@ -75,9 +75,8 @@ def test_accuracy(out):
     ax.set_xlim(0, 70)
     ax.set_xlabel("GSM8K test accuracy (1,319 questions, greedy)")
     ax.grid(axis="y", visible=False)
-    fig.suptitle("GSM8K test accuracy, Qwen2.5-0.5B-Instruct", x=0.01, ha="left", fontweight="bold", fontsize=11)
-    fig.text(0.01, 0.015, "Error bars: 95% binomial interval for runs measured here. "
-             "Published runs use their own prompt, scorer and hardware.", color=MUTED, fontsize=8)
+    fig.suptitle("GSM8K test accuracy: rl-at-home vs. published runs", x=0.01, ha="left", fontweight="bold", fontsize=11)
+    fig.text(0.01, 0.015, "Error bars: 95% interval, for runs measured here.", color=MUTED, fontsize=8)
     fig.tight_layout(rect=(0, 0.05, 1, 1))
     fig.savefig(out / "test_accuracy.png", dpi=160)
     plt.close(fig)
@@ -104,7 +103,7 @@ def reward_and_eval(train, evals, out):
     ax.set_xlabel("training step (16 questions × 8 samples each)")
     ax.set_ylabel("% correct")
     ax.legend(loc="lower right", fontsize=8.5)
-    ax.set_title("Reward and accuracy over one pass of GSM8K train")
+    ax.set_title("Train reward and validation accuracy during training")
     ax.text(0, -0.2, f"Thin line: per step. Markers: {BLOCK}-step means, band = 95% CI. "
             "Eval error bars: 95% binomial interval, 128 questions.", transform=ax.transAxes, color=MUTED, fontsize=8, va="top")
     fig.tight_layout()

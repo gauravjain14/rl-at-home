@@ -1,4 +1,4 @@
-"""From nanoRL/: python -B -m unittest -v test_batching"""
+"""From rl-at-home/: python -B -m unittest -v test_batching"""
 
 import unittest
 
