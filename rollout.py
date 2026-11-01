@@ -111,8 +111,7 @@ def collect_rollout_groups(
         *, group_id, run_epoch, source_learner_step,
         attempt_id=0, num_gens=4, max_samples_per_gen=128
 ) -> RolloutGroup:
-    """Generate and score responses to one unpadded prompt shaped [1, P].
-
+    """
     score_fn(task, response_text) returns a scalar reward.
     source_learner_step identifies the generator's loaded weights; the caller
     must keep those weights unchanged throughout this call.
