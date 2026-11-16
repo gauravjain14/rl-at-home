@@ -290,13 +290,16 @@ if __name__ == "__main__":
 
     ray.init()
     try:
+        # wandb is opt-in: python driver.py gsm8k [checkpoint] --wandb
+        use_wandb = "--wandb" in sys.argv
+        args = [arg for arg in sys.argv[1:] if arg != "--wandb"]
         if ray.cluster_resources().get("GPU", 0) < 1:
             raise RuntimeError("SyncWorker requires one available GPU.")
         tokenizer = AutoTokenizer.from_pretrained(model_name)
         if tokenizer.pad_token_id is None:
             tokenizer.pad_token = tokenizer.eos_token
         # resume: python driver.py <task> <checkpoints/.../step-N>
-        resume_from = str(Path(sys.argv[2]).resolve()) if len(sys.argv) > 2 else None
+        resume_from = str(Path(args[1]).resolve()) if len(args) > 1 else None
         model = AutoModelForCausalLM.from_pretrained(
             resume_from or model_name,
             dtype=torch.float32,
@@ -311,7 +314,7 @@ if __name__ == "__main__":
         generator_cls = HFGenerator
         
         # support for two tasks only so far.
-        task_name = sys.argv[1] if len(sys.argv) > 1 else "gsm8k"
+        task_name = args[0] if args else "gsm8k"
         if task_name == "music":
             max_samples_per_gen, gradient_checkpointing = 2048, True
         task = get_task(task_name)
@@ -332,6 +335,9 @@ if __name__ == "__main__":
             entry for batch in task.batches(tokenizer, split="validation")
             for entry in batch
         ]
+
+        print(f"sync worker {sync_worker}")
+        print(f"rollout worker {rollout_worker}")
         checkpoint_dir = Path("checkpoints") / f"{task_name}-{time.time_ns()}"
         run_config = {
             "model": model_name, "task": task_name, "num_gens": num_gens,
@@ -350,9 +356,10 @@ if __name__ == "__main__":
         }
         # a resumed run continues the wandb run its checkpoint was saved from
         wandb_run_id = (json.loads((Path(resume_from) / "run_config.json").read_text()).get("wandb_run_id")
-                        if resume_from else None)
+                        if resume_from and use_wandb else None)
         # logs to your default wandb account; set WANDB_ENTITY / WANDB_PROJECT to change where
         with wandb.init(
+            mode="online" if use_wandb else "disabled",
             project=os.environ.get("WANDB_PROJECT", "rl-at-home"),
             name=f"{task_name}-{model_name.split('/')[-1]}",
             config=run_config,
@@ -360,7 +367,7 @@ if __name__ == "__main__":
             resume="must" if wandb_run_id else None,
             allow_val_change=True,
         ) as run:
-            run_config["wandb_run_id"] = run.id
+            run_config["wandb_run_id"] = run.id if use_wandb else None
             run.define_metric("learner_step")
             run.define_metric("train/*", step_metric="learner_step")
             run.define_metric("eval/*", step_metric="learner_step")
