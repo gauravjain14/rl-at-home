@@ -321,13 +321,15 @@ class RolloutWorker:
         )
         return rollout_groups
     
+    @torch.no_grad()
     def load_weights(self, weight_snapshot):
         version = weight_snapshot["learner_step"]
         if version < self.learner_step:
             raise ValueError("Cannot load an older policy")
-        # Ordinary Ray actor methods are serial: no collect_group runs here.
+        # finish all pending gpu work
         torch.cuda.synchronize(self.device)
         self.model.load_state_dict(weight_snapshot["state_dict"], strict=True)
+        # still a bit up in the air about this. for later though.
         self.generator.sync(self.model)
         torch.cuda.synchronize(self.device)
         self.learner_step = version

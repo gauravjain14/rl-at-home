@@ -4,6 +4,7 @@ orchestrator of the behavior, learner, environments and verifier
 import torch
 import asyncio
 import itertools
+import collections
 import json
 import os
 import ray
@@ -93,9 +94,11 @@ async def generate_rollouts(inputs,
 
 
 # sync workers
-async def main(sync_worker,
+async def main(sync_worker,  # is the learner worker in async
                *,
                train_batches,
+               rollout_worker=None,
+               lag=0,
                num_train_steps=100,
                groups_per_batch=16,
                run_epoch=0,
@@ -107,6 +110,16 @@ async def main(sync_worker,
                checkpoint_every=100,
                run_config=None,
                start_step=0):
+    if lag < 0:
+        raise ValueError("lag must be non-negative")
+
+    # sync rl
+    rollout_worker = sync_worker if rollout_worker is None else rollout_worker
+    two_workers = rollout_worker is not sync_worker
+
+    print(f"rollout worker {rollout_worker}")
+    print(f"two worker {two_workers}")
+
     if groups_per_batch < 1 or checkpoint_every < 1 or (
         num_train_steps is not None and num_train_steps < 1
     ):
@@ -131,7 +144,7 @@ async def main(sync_worker,
             return None
         output_path = (str(checkpoint_dir / f"eval-{step:06d}.json")
                        if checkpoint_dir is not None else None)
-        scores = await sync_worker.evaluate.remote(
+        scores = await rollout_worker.evaluate.remote(
             eval_inputs, max_samples_per_gen, output_path=output_path,
         )
         print({"learner_step": step, "eval": scores})
@@ -179,6 +192,52 @@ async def main(sync_worker,
     step = start_step
     group_id = 0
     metrics = {}
+
+    batches = iter(train_batches)
+    pending = collections.deque()
+    def submit(input_batch):
+        nonlocal group_id
+        pending.append(rollout_worker.collect_group.remote(
+            tasks=[task for task, _ in input_batch],
+            input_prompts=[inp_prompt["input_ids"] for _, inp_prompt in input_batch],
+            group_id=group_id,
+            run_epoch=run_epoch,
+            max_samples_per_gen=max_samples_per_gen,
+        ))
+        group_id += len(input_batch)
+
+    for input_batch in itertools.islice(batches, lag + 1):
+        submit(input_batch)
+    while pending:
+        wait_start = time.perf_counter()
+        groups = await pending.popleft()
+        rollout_wait = time.perf_counter() - wait_start
+
+        metrics = await sync_worker.train_groups.remote(groups)
+        # time spent waiting on generation: near 0 means training is the bottleneck
+        metrics["rollout_wait_seconds"] = rollout_wait
+        step += 1
+        if two_workers:
+            # not awaited: each actor runs calls in submission order, so this load lands
+            # after the batches already in flight and before the next collect_group
+            rollout_worker.load_weights.remote(sync_worker.export_weights.remote())
+        print({"learner_step": step, **metrics})
+        if wandb_run is not None:
+            wandb_run.log({
+                "learner_step": step,
+                **{f"train/{key}": value for key, value in metrics.items()},
+            })
+        if step % checkpoint_every == 0:
+            last_eval = await checkpoint_and_evaluate(step)
+            last_checkpoint_step = step
+        if num_train_steps is not None and step >= num_train_steps:
+            break
+        input_batch = next(batches, None)
+        if input_batch is not None:
+            submit(input_batch)
+
+    print(f"Sync worker {sync_worker}")
+
     for input_batch in train_batches:
         groups = await sync_worker.collect_group.remote(
             tasks=[task for task, _ in input_batch],
@@ -215,63 +274,15 @@ async def main(sync_worker,
         result["best_checkpoint_dir"] = str(best_checkpoint)
     return result
 
-
-# orchestrator
-# async def main(rollout_worker,
-#                learner_worker,
-#                *,
-#                num_train_steps=100,
-#                groups_per_batch=1,
-#                run_epoch=0,
-#                task_name="gsm8k",
-#                max_samples_per_gen=512,
-#                eval_inputs=None,
-#                checkpoint_dir=None):
-#     if num_train_steps < 1 or groups_per_batch < 1:
-#         raise ValueError("Step count and groups_per_batch must be positive")
-
-#     rollout_buffer = RolloutBuffer(capacity=16, max_lag=2)
-
-#     # Start both workers from the exact same learner snapshot.
-#     await rollout_worker.load_weights.remote(learner_worker.export_weights.remote())
-#     before = None
-#     if eval_inputs is not None:
-#         before = await rollout_worker.evaluate.remote(eval_inputs, max_samples_per_gen)
-#         print({"eval_before": before})
-
-#     async with asyncio.TaskGroup() as tasks:
-#         rollout_producer = tasks.create_task(
-#             generate_rollouts(
-#                 prepare_tasks(batch_size=16, task_name=task_name),
-#                 rollout_worker,
-#                 rollout_buffer,
-#                 run_epoch=run_epoch,
-#                 max_samples_per_gen=max_samples_per_gen,
-#             )
-#         )
-#         learner_consumer = tasks.create_task(
-#             learner_step(
-#                 rollout_buffer,
-#                 learner_worker,
-#                 rollout_worker=rollout_worker,
-#                 num_train_steps=num_train_steps,
-#                 run_epoch=run_epoch,
-#                 groups_per_batch=groups_per_batch,
-#             )
-#         )
-
-#         result = await learner_consumer
-#         # Stop this local request loop; remote-job shutdown belongs to workers.
-#         rollout_producer.cancel()
-
-#     result["buffer_stats"] = rollout_buffer.stats.copy()
-#     if eval_inputs is not None:
-#         result["eval_before"] = before
-#         result["eval_after"] = await rollout_worker.evaluate.remote(eval_inputs, max_samples_per_gen)
-#         print({"eval_after": result["eval_after"]})
-#     if checkpoint_dir is not None:
-#         result["checkpoint_dir"] = await learner_worker.save_checkpoint.remote(str(checkpoint_dir))
-#     return result
+def setup_workers(model, worker_settings, sync_workers=False):
+    if sync_workers:
+        return SyncWorker.remote(model=model, **worker_settings), None
+    # 2+ GPUs: a whole GPU each. 1 GPU: both share it
+    num_gpus = 1 if ray.cluster_resources().get("GPU", 0) >= 2 else 0.5
+    model_ref = ray.put(model)  # one copy in the object store, read by both actors
+    learner_worker = LearnerWorker.options(num_gpus=num_gpus).remote(model=model_ref, **worker_settings)
+    rollout_worker = RolloutWorker.options(num_gpus=num_gpus).remote(model=model_ref, **worker_settings)
+    return learner_worker, rollout_worker
 
 
 if __name__ == "__main__":
@@ -305,23 +316,18 @@ if __name__ == "__main__":
             max_samples_per_gen, gradient_checkpointing = 2048, True
         task = get_task(task_name)
 
-        sync_worker = SyncWorker.remote(
-            model=model, device="cuda:0", pad_token_id=tokenizer.pad_token_id,
-            tokenizer=tokenizer, score_fn=task.score, num_gens=num_gens,
-            answer_parser=task.parse, lr=learning_rate, seed=seed,
-            micro_batch_size=micro_batch_size, update_epochs=update_epochs,
-            num_minibatches=num_minibatches,
+        lag, sync_workers = 1, False
+        worker_settings = dict(
+            device="cuda:0", pad_token_id=tokenizer.pad_token_id, tokenizer=tokenizer,
+            score_fn=task.score, num_gens=num_gens, answer_parser=task.parse,
+            lr=learning_rate, seed=seed, micro_batch_size=micro_batch_size,
+            update_epochs=update_epochs, num_minibatches=num_minibatches,
             gradient_checkpointing=gradient_checkpointing, generator_cls=generator_cls,
         )
+        # sync_worker is the learner when the rollout worker is separate
+        sync_worker, rollout_worker = setup_workers(model, worker_settings, sync_workers)
         del model  # Release the driver's CPU copy after submitting it to Ray.
         start_step = ray.get(sync_worker.load_trainer_state.remote(resume_from)) if resume_from else 0
-        # learner_worker = LearnerWorker.remote(
-        #     model=model, device="cuda:0", pad_token_id=tokenizer.pad_token_id,
-        # )
-        # del model
-        # rollout_worker = RolloutWorker.remote(
-        #     model_name=model_name, score_fn=gsm8k_score_fn, num_gens=4,
-        # )
         eval_inputs = [
             entry for batch in task.batches(tokenizer, split="validation")
             for entry in batch
@@ -340,6 +346,7 @@ if __name__ == "__main__":
             "max_samples_per_gen": max_samples_per_gen, "checkpoint_every": checkpoint_every,
             "num_train_steps": num_train_steps, "step_unit": "training_batches",
             "resumed_from": resume_from, "start_step": start_step,
+            "lag": lag, "sync_workers": sync_workers,
         }
         # a resumed run continues the wandb run its checkpoint was saved from
         wandb_run_id = (json.loads((Path(resume_from) / "run_config.json").read_text()).get("wandb_run_id")
@@ -359,6 +366,7 @@ if __name__ == "__main__":
             run.define_metric("eval/*", step_metric="learner_step")
             result = asyncio.run(main(
                 sync_worker=sync_worker,
+                rollout_worker=rollout_worker, lag=lag,
                 # the task order is fixed by its seed, so skipping the trained batches resumes exactly
                 train_batches=itertools.islice(task.batches(tokenizer, batch_size=groups_per_batch),
                                                start_step, None),
