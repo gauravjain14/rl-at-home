@@ -126,6 +126,7 @@ async def main(sync_worker,  # is the learner worker in async
         raise ValueError("Step count, groups_per_batch and checkpoint_every must be positive")
 
     config = dict(run_config or {})
+    print(f"what is the config {config}")
     config.update(task=task_name, groups_per_batch=groups_per_batch,
                   max_samples_per_gen=max_samples_per_gen, num_train_steps=num_train_steps,
                   checkpoint_every=checkpoint_every, step_unit="training_batches",
@@ -187,6 +188,8 @@ async def main(sync_worker,  # is the learner worker in async
 
     # a resumed run was already evaluated at start_step
     before = await evaluate(0) if start_step == 0 else None
+    if two_workers:
+        await rollout_worker.load_weights.remote(sync_worker.export_weights.remote())
     last_eval, last_checkpoint_step = before, start_step
 
     step = start_step
@@ -235,32 +238,6 @@ async def main(sync_worker,  # is the learner worker in async
         input_batch = next(batches, None)
         if input_batch is not None:
             submit(input_batch)
-
-    print(f"Sync worker {sync_worker}")
-
-    for input_batch in train_batches:
-        groups = await sync_worker.collect_group.remote(
-            tasks=[task for task, _ in input_batch],
-            input_prompts=[inp_prompt["input_ids"] for _, inp_prompt in input_batch],
-            group_id=group_id,
-            run_epoch=run_epoch,
-            max_samples_per_gen=max_samples_per_gen,
-        )
-        group_id += len(groups)
-
-        metrics = await sync_worker.train_groups.remote(groups)
-        step += 1
-        print({"learner_step": step, **metrics})
-        if wandb_run is not None:
-            wandb_run.log({
-                "learner_step": step,
-                **{f"train/{key}": value for key, value in metrics.items()},
-            })
-        if step % checkpoint_every == 0:
-            last_eval = await checkpoint_and_evaluate(step)
-            last_checkpoint_step = step
-        if num_train_steps is not None and step >= num_train_steps:
-            break
 
     if step > 0 and step != last_checkpoint_step:
         last_eval = await checkpoint_and_evaluate(step)
@@ -319,6 +296,7 @@ if __name__ == "__main__":
             max_samples_per_gen, gradient_checkpointing = 2048, True
         task = get_task(task_name)
 
+        # sync_workers = False by default.
         lag, sync_workers = 1, False
         worker_settings = dict(
             device="cuda:0", pad_token_id=tokenizer.pad_token_id, tokenizer=tokenizer,
